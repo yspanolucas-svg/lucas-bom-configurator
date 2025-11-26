@@ -1,4 +1,3 @@
-# app.py
 import io
 import xml.etree.ElementTree as ET
 import streamlit as st
@@ -40,13 +39,13 @@ def is_z_part(part: ET.Element) -> bool:
     return False
 
 
-def transform_to_rcxy_2axes(root: ET.Element) -> None:
+def transform_to_rcxy_2axes(root: ET.Element, comment_override: str | None = None) -> None:
     """
     Modifie l'ASSEMBLY en place :
       - Supprime les PART de l'axe Z (sauf chariot interface)
       - Renomme l'assemblage en RCXY 2 axes surfacique
       - Adapte le commentaire final
-      - Met 'Taille du bras : 0' dans le commentaire
+      - Si comment_override est fourni, l'utilise comme COMMENTAIRE final
     """
     # 1) Renommer l'assemblage
     nt = root.find("NT")
@@ -80,33 +79,72 @@ def transform_to_rcxy_2axes(root: ET.Element) -> None:
                 if vars_el is None:
                     continue
                 comment_el = vars_el.find("COMMENTAIRE")
-                if comment_el is not None and comment_el.text:
-                    # 3.1 Remplacer "Robot cartésien 3 axes" par "2 axes surfacique"
-                    comment_el.text = comment_el.text.replace(
-                        "Robot cartésien 3 axes",
-                        "Robot cartésien 2 axes surfacique"
-                    )
-                    # 3.2 Forcer "Taille du bras : 0"
-                    comment_el.text = comment_el.text.replace(
-                        "Taille du bras : 4",  # si 4 dans ce cas
-                        "Taille du bras : 0"
-                    )
+                if comment_el is not None:
+                    if comment_override is not None:
+                        # On force exactement le texte choisi par l'utilisateur
+                        comment_el.text = comment_override
+                    else:
+                        # Version par défaut : on adapte le texte existant
+                        txt = comment_el.text or ""
+                        txt = txt.replace(
+                            "Robot cartésien 3 axes",
+                            "Robot cartésien 2 axes surfacique"
+                        )
+                        # On force aussi la taille du bras à 0 si présent
+                        txt = txt.replace(
+                            "Taille du bras : 4",
+                            "Taille du bras : 0"
+                        )
+                        comment_el.text = txt
                 break
 
 
-def convert_rc3_to_rcxy(file_bytes: bytes) -> bytes:
+def extract_default_comment(xml_bytes: bytes) -> str:
+    """
+    À partir d'un XML RC3, génère la version RCXY 2 axes surfacique en mémoire
+    et retourne le texte du COMMENTAIRE résultant (par défaut).
+    """
+    buf = io.BytesIO(xml_bytes)
+    tree = ET.parse(buf)
+    root = tree.getroot()
+
+    if root.tag != "ASSEMBLY":
+        raise ValueError("Fichier inattendu : racine != ASSEMBLY")
+
+    # On applique la transformation SANS override de commentaire
+    transform_to_rcxy_2axes(root, comment_override=None)
+
+    # On récupère le commentaire
+    subparts = root.find("SUBPARTS")
+    if subparts is not None:
+        for part in subparts.findall("PART"):
+            nn = (part.findtext("NN") or "").strip().lower()
+            if nn == "commentaire":
+                vars_el = part.find("VARIABLES")
+                if vars_el is None:
+                    break
+                comment_el = vars_el.find("COMMENTAIRE")
+                if comment_el is not None and comment_el.text:
+                    return comment_el.text
+
+    # fallback si rien trouvé
+    return "Robot cartésien 2 axes surfacique - Taille du bras : 0 - ..."    
+
+
+def convert_rc3_to_rcxy(xml_bytes: bytes, comment_override: str | None = None) -> bytes:
     """
     Prend le contenu XML (bytes) d'un RC3,
-    renvoie le contenu XML (bytes) du RCXY 2 axes surfacique.
+    renvoie le contenu XML (bytes) du RCXY 2 axes surfacique,
+    avec éventuellement un COMMENTAIRE surchargé.
     """
-    buf_in = io.BytesIO(file_bytes)
+    buf_in = io.BytesIO(xml_bytes)
     tree = ET.parse(buf_in)
     root = tree.getroot()
 
     if root.tag != "ASSEMBLY":
         raise ValueError("Fichier inattendu : racine != ASSEMBLY")
 
-    transform_to_rcxy_2axes(root)
+    transform_to_rcxy_2axes(root, comment_override=comment_override)
 
     buf_out = io.BytesIO()
     tree.write(buf_out, encoding="utf-8", xml_declaration=True)
@@ -136,7 +174,6 @@ st.markdown("### Choix du produit")
 col1, col2 = st.columns(2)
 col3, col4 = st.columns(2)
 
-# État sélectionné (dans la session)
 if "mode" not in st.session_state:
     st.session_state.mode = None
 
@@ -175,10 +212,10 @@ if st.session_state.mode == "rcxy_2axes":
     st.subheader("RC3 → RCXY 2 axes surfacique")
 
     st.write(
-        "Charge un XML de robot cartésien 3 axes (RC3). "
-        "L’outil supprime l’axe Z (sauf le chariot interface), "
-        "renomme le produit et adapte le commentaire pour générer un "
-        "**RCXY 2 axes surfacique** directement importable dans Sylob."
+        "1️⃣ Charge un XML de robot cartésien 3 axes (RC3). "
+        "2️⃣ L’outil prépare un RCXY 2 axes surfacique et propose un COMMENTAIRE. "
+        "3️⃣ Tu peux modifier le commentaire ci-dessous. "
+        "4️⃣ Clique sur « Convertir avec ce commentaire » pour générer le XML final."
     )
 
     uploaded_file = st.file_uploader(
@@ -187,11 +224,31 @@ if st.session_state.mode == "rcxy_2axes":
         key="upload_rc3"
     )
 
+    # On stocke le XML brut dans la session pour pouvoir le réutiliser
     if uploaded_file is not None:
-        if st.button("Convertir en RCXY 2 axes surfacique"):
+        xml_in = uploaded_file.read()
+        st.session_state["xml_in"] = xml_in
+
+        # Calcul du commentaire par défaut à partir du XML
+        try:
+            default_comment = extract_default_comment(xml_in)
+        except Exception as e:
+            st.error(f"Erreur pendant l'analyse du fichier : {e}")
+            default_comment = ""
+
+        # Zone de texte éditable pour le commentaire
+        st.markdown("#### Commentaire BOM")
+        st.text_area(
+            "Texte du commentaire (modifie librement avant conversion) :",
+            value=default_comment,
+            key="comment_text",
+            height=150
+        )
+
+        if st.button("Convertir avec ce commentaire"):
             try:
-                xml_in = uploaded_file.read()
-                xml_out = convert_rc3_to_rcxy(xml_in)
+                user_comment = st.session_state.get("comment_text", default_comment)
+                xml_out = convert_rc3_to_rcxy(xml_in, comment_override=user_comment)
 
                 st.success("Conversion terminée ✅")
 
@@ -202,11 +259,12 @@ if st.session_state.mode == "rcxy_2axes":
                     mime="application/xml"
                 )
 
-                # Optionnel : petit aperçu (1000 premiers caractères)
                 with st.expander("Voir un extrait du XML généré"):
-                    st.code(xml_out.decode("utf-8")[:1000])
+                    st.code(xml_out.decode("utf-8")[:1500])
 
             except Exception as e:
                 st.error(f"Erreur pendant la conversion : {e}")
+    else:
+        st.info("Charge un fichier XML RC3 pour afficher et éditer le commentaire.")
 else:
     st.info("Sélectionne un produit ci-dessus pour commencer.")
