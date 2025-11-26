@@ -104,32 +104,43 @@ def transform_to_rcxy_2axes(root: ET.Element, comment_override: str | None = Non
 
     # 3) Adapter le commentaire final
     if subparts is not None:
+        # On applique l'override directement sur tous les PART "Commentaire"
+        comment_parts = []
         for part in subparts.findall("PART"):
             nn = (part.findtext("NN") or "").strip().lower()
             if nn == "commentaire":
-                vars_el = part.find("VARIABLES")
-                if vars_el is None:
-                    continue
-                comment_el = vars_el.find("COMMENTAIRE")
-                if comment_el is not None:
-                    if comment_override is not None:
-                        comment_el.text = comment_override
-                    else:
-                        txt = comment_el.text or ""
-                        txt = txt.replace(
-                            "Robot cartésien 3 axes",
-                            "Robot cartésien 2 axes surfacique"
-                        )
-                        txt = txt.replace(
-                            "Taille du bras : 4",
-                            "Taille du bras : 0"
-                        )
-                        txt = txt.replace(
-                            "Taille du bras Z : 4",
-                            "Taille du bras : 0"
-                        )
-                        comment_el.text = txt
-                break
+                comment_parts.append(part)
+
+        if comment_parts:
+            main_part = comment_parts[0]
+            vars_el = main_part.find("VARIABLES")
+            if vars_el is None:
+                vars_el = ET.SubElement(main_part, "VARIABLES")
+            comment_el = vars_el.find("COMMENTAIRE")
+            if comment_el is None:
+                comment_el = ET.SubElement(vars_el, "COMMENTAIRE")
+
+            if comment_override is not None:
+                comment_el.text = comment_override
+            else:
+                txt = comment_el.text or ""
+                txt = txt.replace(
+                    "Robot cartésien 3 axes",
+                    "Robot cartésien 2 axes surfacique"
+                )
+                txt = txt.replace(
+                    "Taille du bras : 4",
+                    "Taille du bras : 0"
+                )
+                txt = txt.replace(
+                    "Taille du bras Z : 4",
+                    "Taille du bras : 0"
+                )
+                comment_el.text = txt
+
+            # On supprime d'autres éventuels PART "Commentaire"
+            for extra in comment_parts[1:]:
+                subparts.remove(extra)
 
 
 def extract_default_comment_rcxy(xml_bytes: bytes) -> str:
@@ -187,7 +198,6 @@ def convert_rc3_to_rcxy(xml_bytes: bytes, comment_override: str | None = None) -
 #  LOGIQUE CANTILEVER (ES + RC2YZ)
 # =========================
 
-# Références "service" que l'on traite avec des règles spécifiques
 SERVICE_REFS = {
     "AL00-ETUDE-MECANIQUE",
     "AL00-MONTAGE-MECANIQUE",
@@ -199,7 +209,6 @@ SERVICE_REFS = {
     "AL00-MONTAGE",
 }
 
-# Références de structure RC2 à supprimer (portique au sol du RC2)
 SUPPORT_REFS_RC2 = {
     "AL00-POTEAU-BAS",
     "ALCS-NEZ-DE-POTEAU",
@@ -207,7 +216,6 @@ SUPPORT_REFS_RC2 = {
     "ALP0-CHEVILLE",
 }
 
-# Référence chariot sur ES (permet de compter le nombre de têtes YZ)
 CHARIOT_REFS_ES = {
     "ALES-CHARIOT-CAT08",
 }
@@ -296,16 +304,7 @@ def build_cantilever(xml_es: bytes, xml_rc2: bytes, comment_override: str | None
     Construit un BOM 'ROBOT CANTILEVER 3 AXES XYZ' à partir de :
       - xml_es  : axe élevé sur poteaux (ES1, ES2...)
       - xml_rc2 : robot 2 axes YZ (RC2)
-
-    Gère :
-      - nb de chariots ES (1 ou 2 têtes)
-      - suppression de la structure au sol RC2
-      - duplication de la mécanique RC2 selon nb de têtes
-      - règles de services ES + RC2 décrites avec remise 10%
-      - NT / LINA adaptés selon nb de charges
-      - commentaire éventuellement surchargé
     """
-    # Parse des deux XML
     tree_es = ET.parse(io.BytesIO(xml_es))
     root_es = tree_es.getroot()
 
@@ -332,16 +331,14 @@ def build_cantilever(xml_es: bytes, xml_rc2: bytes, comment_override: str | None
     for part in rc2_non_services_raw:
         ref = get_ref_sylob(part)
         if ref in SUPPORT_REFS_RC2:
-            # On ignore la structure au sol du RC2 (poteaux, barreaux, chevilles...)
             continue
         rc2_non_services.append(part)
 
-    # 4) Préparation SUBPARTS vidé pour repartir proprement
-    # On supprime tous les PART actuels de ES, puis on reconstruit
+    # 4) Réinitialisation du SUBPARTS de ES
     for p in list(sub_es.findall("PART")):
         sub_es.remove(p)
 
-    # 5) Fusion mécanique ES + RC2 (dupliqué selon nb de têtes)
+    # 5) Fusion mécanique ES + RC2 (multiplié par nb de têtes)
     mechanical_by_ref = {}
     no_ref_parts = []
 
@@ -360,13 +357,12 @@ def build_cantilever(xml_es: bytes, xml_rc2: bytes, comment_override: str | None
         else:
             mechanical_by_ref[ref]["qty"] += qty
 
-    # 5.2 RC2 non-services, mécaniques (multipliés par nb de têtes)
+    # 5.2 RC2 non-services
     for part in rc2_non_services:
         ref = get_ref_sylob(part)
         qty_base = get_qty_sylob(part)
         qty = qty_base * n_chariots
         if not ref:
-            # pas de ref Sylob → on ajoute autant de fois que de têtes
             for _ in range(max(1, n_chariots)):
                 no_ref_parts.append(copy.deepcopy(part))
             continue
@@ -389,10 +385,10 @@ def build_cantilever(xml_es: bytes, xml_rc2: bytes, comment_override: str | None
     for p in no_ref_parts:
         sub_es.append(p)
 
-    # 6) Calcul des services finaux
+    # 6) Services finaux
     final_services_qty = compute_final_services(es_services_qty, rc2_services_qty_base, n_chariots)
 
-    # 6.1 Sélection du template pour chaque ref de service
+    # 6.1 Templates
     service_templates = {}
     for ref in SERVICE_REFS:
         if ref in es_services_tpl:
@@ -400,7 +396,7 @@ def build_cantilever(xml_es: bytes, xml_rc2: bytes, comment_override: str | None
         elif ref in rc2_services_tpl:
             service_templates[ref] = rc2_services_tpl[ref]
 
-    # 6.2 Création des PART de service finaux
+    # 6.2 Ajout des services finaux
     for ref, qty in final_services_qty.items():
         tpl = service_templates.get(ref)
         if tpl is None:
@@ -421,25 +417,39 @@ def build_cantilever(xml_es: bytes, xml_rc2: bytes, comment_override: str | None
     charge_label = "CHARGE" if n_chariots <= 1 else "CHARGES"
     lina_el.text = f"LUCAS - ROBOT CANTILEVER 3 AXES XYZ - {n_chariots} {charge_label}"
 
-    # 8) Commentaire
-    # On cherche le PART "Commentaire" dans ES (puisque c'est la base)
-    for part in sub_es.findall("PART"):
-        nn = (part.findtext("NN") or "").strip().lower()
-        if nn == "commentaire":
-            vars_el = part.find("VARIABLES")
+    # 8) Commentaire : on force UN SEUL PART "Commentaire" avec le texte souhaité
+    sub_es = root_es.find("SUBPARTS")
+    if sub_es is not None:
+        comment_parts = []
+        for part in sub_es.findall("PART"):
+            nn = (part.findtext("NN") or "").strip().lower()
+            if nn == "commentaire":
+                comment_parts.append(part)
+
+        if comment_parts:
+            main_part = comment_parts[0]
+            vars_el = main_part.find("VARIABLES")
             if vars_el is None:
-                break
+                vars_el = ET.SubElement(main_part, "VARIABLES")
             comment_el = vars_el.find("COMMENTAIRE")
-            if comment_el is not None:
-                if comment_override is not None:
-                    comment_el.text = comment_override
-                else:
-                    txt = comment_el.text or ""
-                    txt = txt.replace("Robot cartésien 2 axes YZ", "Robot cantilever 3 axes XYZ")
-                    txt = txt.replace("Robot cartésien 3 axes", "Robot cantilever 3 axes XYZ")
-                    txt = txt.replace("Robot cantilever 2 axes YZ", "Robot cantilever 3 axes XYZ")
-                    comment_el.text = txt
-            break
+            if comment_el is None:
+                comment_el = ET.SubElement(vars_el, "COMMENTAIRE")
+
+            if comment_override is not None:
+                comment_el.text = comment_override
+
+            # On supprime les autres PART "Commentaire"
+            for extra in comment_parts[1:]:
+                sub_es.remove(extra)
+        else:
+            # Si aucun commentaire n'existe et que l'utilisateur a saisi un texte
+            if comment_override:
+                main_part = ET.SubElement(sub_es, "PART")
+                nn_el = ET.SubElement(main_part, "NN")
+                nn_el.text = "Commentaire"
+                vars_el = ET.SubElement(main_part, "VARIABLES")
+                com_el = ET.SubElement(vars_el, "COMMENTAIRE")
+                com_el.text = comment_override
 
     # 9) Export XML
     buf_out = io.BytesIO()
@@ -499,12 +509,12 @@ col3, col4 = st.columns(2)
 if "mode" not in st.session_state:
     st.session_state.mode = None
 
-# Carte 1 : RCXY 2 axes surfacique (EXISTANT, ON NE TOUCHE PAS)
+# Carte 1 : RCXY 2 axes surfacique (EXISTANT)
 with col1:
     st.markdown("#### 🧱 RCXY 2 axes surfacique")
     st.write(
-        "À partir d’un RC3 (3 axes), suppression de l’axe Z, "
-        "en gardant le chariot Z comme interface robot, pour obtenir un robot "
+        "À partir d’un RC3 (3 axes), suppression de l’axe Z (sauf le chariot interface), "
+        "renommage du produit et adaptation du commentaire pour obtenir un robot "
         "**2 axes surfacique** compatible Sylob."
     )
     if st.button("Ouvrir", key="btn_rcxy"):
@@ -515,7 +525,8 @@ with col2:
     st.markdown("#### 🏗️ Robot cantilever 3 axes XYZ")
     st.write(
         "Fusion d’un axe élevé sur poteaux (ES) avec un robot 2 axes YZ (RC2). "
-        "Gère automatiquement 1 ou 2 têtes YZ selon le nombre de chariots sur l’ES."
+        "Le configurateur génère automatiquement un robot cantilever 3 axes XYZ, "
+        "en gérant 1 ou 2 têtes YZ selon le nombre de chariots sur l’axe élevé."
     )
     if st.button("Ouvrir", key="btn_cantilever"):
         st.session_state.mode = "cantilever"
@@ -540,10 +551,10 @@ if st.session_state.mode == "rcxy_2axes":
     st.subheader("RC3 → RCXY 2 axes surfacique")
 
     st.write(
-        "1️⃣ Charge un XML de robot cartésien 3 axes (RC3). "
+        "1️⃣ Chargez un XML de robot cartésien 3 axes (RC3).\n"
         "2️⃣ L’outil supprime l’axe Z (sauf le chariot interface), renomme le produit "
-        "et adapte le commentaire pour générer un **RCXY 2 axes surfacique**. "
-        "3️⃣ Tu peux modifier le commentaire avant la génération du XML final."
+        "et adapte le commentaire pour générer un **RCXY 2 axes surfacique**.\n"
+        "3️⃣ Vous pouvez modifier le commentaire avant la génération du XML final."
     )
 
     uploaded_file = st.file_uploader(
@@ -556,7 +567,7 @@ if st.session_state.mode == "rcxy_2axes":
         xml_in = uploaded_file.read()
         st.session_state["xml_rc3_in"] = xml_in
 
-        # Calcul du commentaire par défaut à partir du XML
+        # Commentaire par défaut à partir du XML
         try:
             default_comment = extract_default_comment_rcxy(xml_in)
         except Exception as e:
@@ -565,7 +576,7 @@ if st.session_state.mode == "rcxy_2axes":
 
         st.markdown("#### Commentaire RCXY 2 axes surfacique")
         st.text_area(
-            "Texte du commentaire (modifie librement avant conversion) :",
+            "Texte du commentaire (modifiez-le librement avant conversion) :",
             value=default_comment,
             key="comment_rcxy",
             height=150
@@ -585,25 +596,20 @@ if st.session_state.mode == "rcxy_2axes":
                     mime="application/xml"
                 )
 
-                with st.expander("Voir un extrait du XML généré"):
-                    st.code(xml_out.decode("utf-8")[:1500])
-
             except Exception as e:
                 st.error(f"Erreur pendant la conversion : {e}")
     else:
-        st.info("Charge un fichier XML RC3 pour afficher et éditer le commentaire.")
+        st.info("Veuillez charger un fichier XML RC3 pour afficher et éditer le commentaire.")
 
 elif st.session_state.mode == "cantilever":
     st.subheader("Cantilever = axe élevé ES + robot 2 axes RC2 (1 ou 2 têtes)")
 
     st.write(
-        "1️⃣ Charge un XML d’axe linéaire élevé sur poteaux (ES1, ES2...).\n"
-        "2️⃣ Charge un XML de robot cartésien 2 axes YZ (RC2).\n"
-        "3️⃣ L’outil fusionne les deux BOM, supprime le portique au sol RC2, "
-        "gère 1 ou 2 têtes YZ selon le nombre de chariots ES et applique les "
-        "règles de services ES + RC2 (avec remise 10% sur la partie RC2 pour "
-        "l'étude et le montage mécanique).\n"
-        "4️⃣ Tu peux éditer le commentaire avant de générer le XML cantilever."
+        "1️⃣ Chargez un XML d’axe linéaire élevé sur poteaux (ES1, ES2...).\n"
+        "2️⃣ Chargez un XML de robot cartésien 2 axes YZ (RC2).\n"
+        "3️⃣ L’outil fusionne les deux BOM, gère automatiquement 1 ou 2 têtes YZ "
+        "et produit un **robot cantilever 3 axes XYZ** compatible Sylob.\n"
+        "4️⃣ Vous pouvez éditer le commentaire avant de générer le XML cantilever."
     )
 
     es_file = st.file_uploader(
@@ -624,7 +630,7 @@ elif st.session_state.mode == "cantilever":
         st.session_state["xml_es_in"] = xml_es
         st.session_state["xml_rc2_in"] = xml_rc2
 
-        # Commentaire par défaut basé sur le RC2 (remappé en cantilever)
+        # Commentaire par défaut basé sur le RC2 (adapté en cantilever)
         try:
             default_comment_cant = extract_default_comment_cantilever(xml_rc2)
         except Exception as e:
@@ -633,7 +639,7 @@ elif st.session_state.mode == "cantilever":
 
         st.markdown("#### Commentaire cantilever")
         st.text_area(
-            "Texte du commentaire (modifie librement avant fusion) :",
+            "Texte du commentaire (modifiez-le librement avant fusion) :",
             value=default_comment_cant,
             key="comment_cantilever",
             height=150
@@ -653,13 +659,10 @@ elif st.session_state.mode == "cantilever":
                     mime="application/xml"
                 )
 
-                with st.expander("Voir un extrait du XML généré"):
-                    st.code(xml_out.decode("utf-8")[:1500])
-
             except Exception as e:
                 st.error(f"Erreur pendant la fusion : {e}")
     else:
-        st.info("Charge les deux fichiers XML (ES + RC2) pour pouvoir fusionner.")
+        st.info("Veuillez charger les deux fichiers XML (ES + RC2) pour pouvoir fusionner.")
 
 else:
-    st.info("Sélectionne un produit ci-dessus pour commencer.")
+    st.info("Sélectionnez un produit ci-dessus pour commencer.")
