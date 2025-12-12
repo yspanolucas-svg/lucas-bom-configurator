@@ -3,7 +3,8 @@ import copy
 import xml.etree.ElementTree as ET
 import streamlit as st
 
-from pdf_lab import render_pdf_lab_panel
+import pdf_lab
+
 # =========================
 #  OUTILS XML GÉNÉRIQUES
 # =========================
@@ -491,7 +492,7 @@ def extract_default_comment_cantilever(xml_rc2: bytes) -> str:
 st.set_page_config(
     page_title="Lucas – Config BOM",
     page_icon="🤖",
-    layout="centered"
+    layout="wide"
 )
 
 st.title("🧩 Lucas – Configurateur BOM (XML → Sylob)")
@@ -534,27 +535,20 @@ with col2:
 
 # Carte 3 : Axes verticaux (placeholder)
 with col3:
-    st.markdown("#### ⬆️ Axes verticaux")
-    st.write("Bientôt disponible.")
-    st.button("Bientôt", key="btn_verticaux", disabled=True)
+    st.markdown("#### 📄 PDF Lab (fusion / nettoyage)")
+    st.write(
+        "Outil indépendant pour nettoyer ou assembler des fiches techniques PDF : "
+        "sélection des lignes à conserver, suppression des sections non souhaitées, "
+        "et génération d’un PDF final au format Lucas."
+    )
+    if st.button("Ouvrir", key="btn_pdf_lab"):
+        st.session_state.mode = "pdf_lab"
 
 # Carte 4 : Axes verticaux sur axe X (placeholder)
 with col4:
     st.markdown("#### ↗️ Axes verticaux sur axe X")
     st.write("Bientôt disponible.")
     st.button("Bientôt", key="btn_verticaux_x", disabled=True)
-
-
-# Carte 5 : PDF Lab (fusion & simplification)
-st.markdown("#### 🧾 PDF Lab – Fusion & simplification des fiches techniques")
-st.write(
-    "Outil transversal (hors typologie produit) pour fusionner et nettoyer deux fiches techniques PDF "
-    "(ex : Ensemble X = axe élevé / Ensemble YZ = robot 2 axes). "
-    "L’utilisateur choisit les variables à conserver ; illustrations / BOM / dimensionnement moteur ne sont pas repris."
-)
-if st.button("Ouvrir", key="btn_pdf_lab"):
-    st.session_state.mode = "pdf_lab"
-
 
 st.markdown("---")
 
@@ -677,8 +671,9 @@ elif st.session_state.mode == "cantilever":
     else:
         st.info("Veuillez charger les deux fichiers XML (ES + RC2) pour pouvoir fusionner.")
 
+
 elif st.session_state.mode == "pdf_lab":
-    render_pdf_lab_panel()
+    pdf_lab.render_pdf_lab_panel()
 
 else:
     st.info("Sélectionnez un produit ci-dessus pour commencer.")
