@@ -3,10 +3,12 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
+import pandas as pd
 from PyPDF2 import PdfReader
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
+
 
 # =========================
 #  PDF LAB - EXTRACTION
@@ -14,9 +16,11 @@ from reportlab.lib.units import mm
 
 @dataclass
 class PDFRow:
+    key: str          # internal unique key (stable in app run)
     label: str
     value: str
-    source: str  # "Ensemble X" / "Ensemble YZ" etc.
+    source: str       # "Ensemble X" / "Ensemble YZ"
+    section: str      # "main" or "options"
 
 
 def _pdf_text(pdf_bytes: bytes) -> str:
@@ -25,11 +29,8 @@ def _pdf_text(pdf_bytes: bytes) -> str:
     for page in reader.pages:
         t = page.extract_text() or ""
         chunks.append(t)
-    # Normalize whitespace
     text = "\n".join(chunks)
     text = text.replace("\r", "\n")
-    # NOTE: keep multiple spaces (PDF extraction often uses them as column separators)
-    # collapse too many blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -65,16 +66,16 @@ def _find_section_bounds(text: str, start_patterns: List[str], end_patterns: Lis
 def parse_table_like_lines(block: str) -> List[Tuple[str, str]]:
     """
     Parses lines like:
-      "Charge admissible (X) 1000.0 kg ES"
-    or:
+      "Useful stroke X 10000 mm"
       "Place of delivery and installation France"
-    We try to split with "  " or last numeric-ish token; robust enough for our generated PDFs.
+    Heuristic split: double spaces OR "label + rest".
     """
     rows: List[Tuple[str, str]] = []
     for raw in block.splitlines():
         line = raw.strip()
         if not line:
             continue
+
         # skip table headers
         if re.match(r"^(Variable|Option / Condition)\b", line, flags=re.I):
             continue
@@ -83,8 +84,7 @@ def parse_table_like_lines(block: str) -> List[Tuple[str, str]]:
         if re.match(r"^(Source)\b", line, flags=re.I):
             continue
 
-        # If the line has at least 2 "columns", split heuristically
-        # Prefer split by "  " if present in extracted text (often not).
+        # prefer "  " split
         if "  " in line:
             parts = [p.strip() for p in line.split("  ") if p.strip()]
             if len(parts) >= 2:
@@ -93,79 +93,120 @@ def parse_table_like_lines(block: str) -> List[Tuple[str, str]]:
                 rows.append((label, value))
                 continue
 
-        # Otherwise: split at last occurrence of " kg", " mm", " m/s", " m/s²", " months" etc.
+        # fallback: "label" then "rest"
         m = re.search(r"^(.*?)(\s[-+0-9].*)$", line)
         if m:
             label = m.group(1).strip()
             value = m.group(2).strip()
             rows.append((label, value))
         else:
-            # fallback: keep whole line as label, empty value
+            # last resort
             rows.append((line, ""))
+
     return rows
 
 
-def extract_pdf_variables(pdf_bytes: bytes, source_label: str) -> Dict[str, PDFRow]:
+# =========================
+#  FILTERS (avoid confusion)
+# =========================
+
+MOTOR_BLACKLIST = [
+    "motor", "moteur",
+    "torque", "couple",
+    "brake", "frein",
+    "inertia", "inertie",
+    "required motor speed", "vitesse moteur",
+    "emergency stop", "arrêt d'urgence", "arret d'urgence",
+    "nominal torque",
+    "kg.cm", "kgcm",
+]
+
+BOM_BLACKLIST = [
+    "bill of material", "product bill of material", "bom", "nomenclature",
+]
+
+ILLUSTRATION_BLACKLIST = [
+    "illustration", "illustrations", "photo", "image", "images",
+]
+
+def _is_blacklisted(label: str) -> bool:
+    s = (label or "").lower()
+    return any(k in s for k in MOTOR_BLACKLIST) or any(k in s for k in BOM_BLACKLIST) or any(k in s for k in ILLUSTRATION_BLACKLIST)
+
+
+def _canon(label: str) -> str:
+    return re.sub(r"\s+", " ", (label or "")).strip()
+
+
+def extract_pdf_rows(pdf_bytes: bytes, source_label: str) -> List[PDFRow]:
     """
-    Extracts:
+    Extracts rows from:
       - Main characteristics
-      - Options & conditions
-    Returns dict keyed by canonical label.
+      - Options & Conditions
+    Returns list of PDFRow. Keys are unique (even if label duplicates).
     """
     text = _pdf_text(pdf_bytes)
     lang = detect_language(text)
 
     if lang == "EN":
-        main_start = [r"\bMain characteristics\b"]
+        main_start = [r"\bMain characteristics\b", r"\bGeneral characteristics\b"]
         main_end = [r"\bOptions\s*&\s*Conditions\b", r"\bOptions\b"]
         opt_start = [r"\bOptions\s*&\s*Conditions\b"]
-        opt_end = [r"\b$"]  # until end
+        opt_end = [r"\b$"]
     else:
-        main_start = [r"\bCaract[ée]ristiques principales\b"]
+        main_start = [r"\bCaract[ée]ristiques principales\b", r"\bCaract[ée]ristiques\b"]
         main_end = [r"\bOptions\s*&\s*Conditions\b", r"\bOptions\b", r"\bConditions\b"]
         opt_start = [r"\bOptions\s*&\s*Conditions\b", r"\bOptions\b"]
         opt_end = [r"\b$"]
 
-    out: Dict[str, PDFRow] = {}
+    rows: List[PDFRow] = []
+    counters: Dict[str, int] = {}  # per canonical label
 
+    def add_rows(block: str, section: str):
+        nonlocal rows, counters
+        for label, value in parse_table_like_lines(block):
+            c = _canon(label)
+            if not c:
+                continue
+            if _is_blacklisted(c):
+                continue
+
+            counters[c] = counters.get(c, 0) + 1
+            # unique key even if same label appears multiple times in same source
+            key = f"{source_label}::{section}::{c}::{counters[c]}"
+            rows.append(PDFRow(key=key, label=label, value=value, source=source_label, section=section))
+
+    # main
     bounds = _find_section_bounds(text, main_start, main_end)
     if bounds:
-        block = text[bounds[0]:bounds[1]].strip()
-        for label, value in parse_table_like_lines(block):
-            key = re.sub(r"\s+", " ", label).strip()
-            if key:
-                out[key] = PDFRow(label=label, value=value, source=source_label)
+        add_rows(text[bounds[0]:bounds[1]].strip(), section="main")
 
+    # options
     bounds = _find_section_bounds(text, opt_start, opt_end)
     if bounds:
-        block = text[bounds[0]:bounds[1]].strip()
-        for label, value in parse_table_like_lines(block):
-            key = re.sub(r"\s+", " ", label).strip()
-            if key and key not in out:
-                out[key] = PDFRow(label=label, value=value, source=source_label)
+        add_rows(text[bounds[0]:bounds[1]].strip(), section="options")
 
-
-    # Fallback: if the PDF doesn't contain our section titles, parse all "Label  Value" lines.
-    if not out:
+    # Fallback if sections not found
+    if not rows:
         for raw in text.splitlines():
             line = raw.strip()
             if not line:
                 continue
-            # Skip obvious titles
             if re.match(r"^(LUCAS\b|HIGH\b|2-AXES\b|RC2\b|ALES\b)", line, flags=re.I):
                 continue
-            # Split on 2+ spaces (typical extraction)
             m = re.match(r"^(.*?)[ ]{2,}(.+)$", line)
             if not m:
                 continue
             label = m.group(1).strip().rstrip(":")
             value = m.group(2).strip()
-            if len(label) < 2 or len(value) < 1:
+            c = _canon(label)
+            if not c or _is_blacklisted(c):
                 continue
-            key = re.sub(r"\s+", " ", label).strip()
-            out[key] = PDFRow(label=label, value=value, source=source_label)
+            counters[c] = counters.get(c, 0) + 1
+            key = f"{source_label}::fallback::{c}::{counters[c]}"
+            rows.append(PDFRow(key=key, label=label, value=value, source=source_label, section="main"))
 
-    return out
+    return rows
 
 
 # =========================
@@ -178,20 +219,16 @@ def _draw_lucas_header(c: canvas.Canvas, lang: str) -> float:
     """
     w, h = A4
 
-    # Black band
     c.setFillGray(0.05)
     c.rect(0, h - 22*mm, w, 22*mm, stroke=0, fill=1)
 
-    # Red accent
     c.setFillColorRGB(0.85, 0.0, 0.0)
     c.rect(0, h - 22*mm, w, 3.5*mm, stroke=0, fill=1)
 
-    # White text
     c.setFillColorRGB(1, 1, 1)
     c.setFont("Helvetica-Bold", 13)
     c.drawString(12*mm, h - 14*mm, "LUCAS ROBOTIC SYSTEM")
 
-    # Subtitle (generic, no "RC2/ES" wording)
     c.setFont("Helvetica", 10)
     subtitle = "TECHNICAL DATA SHEET" if lang == "EN" else "FICHE TECHNIQUE"
     c.drawRightString(w - 12*mm, h - 14*mm, subtitle)
@@ -204,7 +241,6 @@ def _draw_table(c: canvas.Canvas, x: float, y: float, w: float, rows: List[PDFRo
     Simple table with 3 columns: Variable / Value / Source.
     Returns new y position.
     """
-    # Table style
     c.setFont("Helvetica-Bold", 11)
     c.setFillGray(0)
     c.drawString(x, y, title)
@@ -215,9 +251,9 @@ def _draw_table(c: canvas.Canvas, x: float, y: float, w: float, rows: List[PDFRo
     col3 = x + w*0.83
 
     c.setFont("Helvetica-Bold", 9)
-    h1 = "Variable" if lang == "EN" else "Variable"
+    h1 = "Variable"
     h2 = "Value" if lang == "EN" else "Valeur"
-    h3 = "Source" if lang == "EN" else "Source"
+    h3 = "Source"
     c.drawString(col1, y, h1)
     c.drawString(col2, y, h2)
     c.drawString(col3, y, h3)
@@ -235,7 +271,6 @@ def _draw_table(c: canvas.Canvas, x: float, y: float, w: float, rows: List[PDFRo
         text = (text or "").strip()
         if not text:
             return [""]
-        # crude wrap by chars; works well for our short labels/values
         words = text.split(" ")
         lines: List[str] = []
         cur = ""
@@ -250,17 +285,15 @@ def _draw_table(c: canvas.Canvas, x: float, y: float, w: float, rows: List[PDFRo
         return lines or [""]
 
     for r in rows:
-        # wrap label/value
-        lab_lines = wrap(r.label, 45)
-        val_lines = wrap(r.value, 35)
+        lab_lines = wrap(r.label, 48)
+        val_lines = wrap(r.value, 36)
         n = max(len(lab_lines), len(val_lines), 1)
         row_h = n * 4.2*mm
 
-        # page break
         if y - row_h < 15*mm:
             c.showPage()
             y = _draw_lucas_header(c, lang)
-            # redraw section title + headers quickly
+
             c.setFont("Helvetica-Bold", 11)
             c.drawString(x, y, title)
             y -= 6*mm
@@ -287,43 +320,31 @@ def _draw_table(c: canvas.Canvas, x: float, y: float, w: float, rows: List[PDFRo
 def build_fusion_pdf(
     pdf_x_bytes: bytes,
     pdf_yz_bytes: bytes,
-    keep_labels: Optional[List[str]] = None,
+    keep_keys: Optional[List[str]] = None,
 ) -> bytes:
     """
     Create a cleaned & fused PDF.
-    - Sources renamed to Ensemble X and Ensemble YZ (as requested).
+    - Sources renamed to Ensemble X and Ensemble YZ.
     - No "FUSION PDF / document généré..." sentence.
-    - Keeps Lucas header style.
+    - Removes motor/BOM variables BEFORE selection.
     """
-    vars_x = extract_pdf_variables(pdf_x_bytes, source_label="Ensemble X")
-    vars_yz = extract_pdf_variables(pdf_yz_bytes, source_label="Ensemble YZ")
+    rows_x = extract_pdf_rows(pdf_x_bytes, source_label="Ensemble X")
+    rows_yz = extract_pdf_rows(pdf_yz_bytes, source_label="Ensemble YZ")
 
-    # Decide language based on X first then YZ
+    # Decide language based on X first then YZ (keeps “source-like” behavior)
     lang = detect_language(_pdf_text(pdf_x_bytes)) or detect_language(_pdf_text(pdf_yz_bytes))
 
-    # Merge
-    merged: Dict[str, PDFRow] = {}
-    for d in (vars_x, vars_yz):
-        for k, row in d.items():
-            merged.setdefault(k, row)  # keep first occurrence
+    # Merge rows (keep all; keys are unique)
+    merged_rows = rows_x + rows_yz
 
-    # Filter
-    keys = list(merged.keys())
-    if keep_labels:
-        keep_set = set(keep_labels)
-        keys = [k for k in keys if k in keep_set]
+    # Filter by selection
+    if keep_keys is not None:
+        keep_set = set(keep_keys)
+        merged_rows = [r for r in merged_rows if r.key in keep_set]
 
-    # Split into 2 sections based on common keywords (simple heuristic)
-    main_keys = []
-    opt_keys = []
-    for k in keys:
-        if re.search(r"(Warranty|Place of delivery|Distance|tests|garant|livraison|distance|test|warranty)", k, flags=re.I):
-            opt_keys.append(k)
-        else:
-            main_keys.append(k)
-
-    main_rows = [merged[k] for k in main_keys]
-    opt_rows = [merged[k] for k in opt_keys]
+    # Split sections by their extracted section
+    main_rows = [r for r in merged_rows if r.section == "main"]
+    opt_rows = [r for r in merged_rows if r.section == "options"]
 
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
@@ -333,7 +354,7 @@ def build_fusion_pdf(
     w = A4[0] - 24*mm
 
     title_main = "Main characteristics" if lang == "EN" else "Caractéristiques principales"
-    title_opt = "Options & Conditions" if lang == "EN" else "Options & Conditions"
+    title_opt = "Options & Conditions"  # same text both languages (OK)
 
     y = _draw_table(c, x, y, w, main_rows, lang, title_main)
     y -= 2*mm
@@ -349,13 +370,15 @@ def build_fusion_pdf(
 
 def render_pdf_lab_panel():
     import streamlit as st
+
     st.subheader("PDF Lab – Fusion & simplification des fiches techniques")
 
     st.write(
         "Objectif : générer une fiche technique **propre et rigoureuse** à partir de deux PDFs source.\n\n"
-        "- Suppression implicite : illustrations, nomenclature/BOM, dimensionnement moteur (non repris dans la sortie).\n"
+        "- Les variables moteur/BOM n'apparaissent pas dans la sélection.\n"
         "- L'utilisateur choisit quelles variables conserver.\n"
-        "- Sources renommées : **Ensemble X** et **Ensemble YZ**."
+        "- Sources renommées : **Ensemble X** et **Ensemble YZ**.\n"
+        "- Aucune traduction : chaque valeur reste dans la langue du PDF source."
     )
 
     colA, colB = st.columns(2)
@@ -371,22 +394,78 @@ def render_pdf_lab_panel():
     x_bytes = pdf_x.read()
     yz_bytes = pdf_yz.read()
 
-    # Preview list of variables
-    vars_x = extract_pdf_variables(x_bytes, source_label="Ensemble X")
-    vars_yz = extract_pdf_variables(yz_bytes, source_label="Ensemble YZ")
-    all_keys = sorted(set(vars_x.keys()) | set(vars_yz.keys()))
+    rows_x = extract_pdf_rows(x_bytes, source_label="Ensemble X")
+    rows_yz = extract_pdf_rows(yz_bytes, source_label="Ensemble YZ")
+    all_rows = rows_x + rows_yz
+
+    # Dataframe for UI
+    df = pd.DataFrame([{
+        "Keep": True,
+        "Label": r.label,
+        "Value": r.value,
+        "Source": r.source,
+        "Section": r.section,
+        "_key": r.key,
+    } for r in all_rows])
+
+    # Counters (to remove doubt about fusion)
+    st.info(
+        f"Detected rows: {len(df)}  |  "
+        f"Ensemble X: {(df['Source']=='Ensemble X').sum()}  |  "
+        f"Ensemble YZ: {(df['Source']=='Ensemble YZ').sum()}"
+    )
 
     st.markdown("#### Sélection des variables à conserver")
-    keep = st.multiselect(
-        "Variables (décocher pour supprimer) :",
-        options=all_keys,
-        default=all_keys,
-        help="La sortie PDF ne reprend que les variables sélectionnées."
+
+    search = st.text_input("Search (filters Label/Value):", value="", key="pdf_search")
+    df_view = df.copy()
+    if search.strip():
+        s = search.strip().lower()
+        df_view = df_view[
+            df_view["Label"].str.lower().str.contains(s, na=False)
+            | df_view["Value"].astype(str).str.lower().str.contains(s, na=False)
+        ]
+
+    edited = st.data_editor(
+        df_view[["Keep", "Label", "Value", "Source", "Section", "_key"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Keep": st.column_config.CheckboxColumn("Keep", default=True),
+            "Label": st.column_config.TextColumn("Label", disabled=True),
+            "Value": st.column_config.TextColumn("Value"),
+            "Source": st.column_config.TextColumn("Source", disabled=True),
+            "Section": st.column_config.TextColumn("Section", disabled=True),
+            "_key": st.column_config.TextColumn("key", disabled=True, width="small"),
+        },
+        key="pdf_rows_editor",
     )
+
+    # Reinject edited rows into full df by key
+    # (only changed rows in view are applied)
+    ed_map = {row["_key"]: row for _, row in edited.iterrows()}
+    for i in range(len(df)):
+        k = df.at[i, "_key"]
+        if k in ed_map:
+            df.at[i, "Keep"] = bool(ed_map[k]["Keep"])
+            df.at[i, "Value"] = str(ed_map[k]["Value"])
 
     if st.button("Générer le PDF fusionné", key="btn_pdf_fusion"):
         try:
-            out = build_fusion_pdf(x_bytes, yz_bytes, keep_labels=keep)
+            keep_keys = df[df["Keep"]]["_key"].tolist()
+
+            # apply edited values back into objects
+            # (we regenerate from rows_x/rows_yz then override values from df)
+            all_rows_map = {r.key: r for r in all_rows}
+            for _, row in df.iterrows():
+                k = row["_key"]
+                if k in all_rows_map:
+                    all_rows_map[k].value = str(row["Value"])
+
+            # build pdf using selected keys (with updated values)
+            # we just pass original bytes + keep list; rows extraction is deterministic
+            out = build_fusion_pdf(x_bytes, yz_bytes, keep_keys=keep_keys)
+
             st.success("PDF généré ✅")
             st.download_button(
                 "💾 Télécharger la fiche technique fusionnée",
