@@ -37,19 +37,25 @@ def _pdf_text(pdf_bytes: bytes) -> str:
 
 
 def _parse_pairs_all(text: str) -> List[tuple]:
+    """
+    Parse table-like lines.
+    Handles:
+      - "Label  Value" (double spaces)
+      - "Robot weight 250.0 kg" (single-space export)
+    """
     rows = []
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
 
-        # "Label  Value" (double spaces)
+        # Prefer: "Label  Value"
         m = re.match(r"^(.*?)[ ]{2,}(.+)$", line)
         if m:
             rows.append((m.group(1).strip(), m.group(2).strip()))
             continue
 
-        # "Label 250.0 kg" (numeric chunk at end)
+        # Common: label + numeric chunk at end
         m2 = re.match(r"^(.*?)([-+]?\d[\d.,]*\s*.*)$", line)
         if m2 and len(m2.group(1).strip()) >= 3:
             rows.append((m2.group(1).strip(), m2.group(2).strip()))
@@ -66,6 +72,10 @@ def _parse_pairs_all(text: str) -> List[tuple]:
 
 
 def extract_pdf_rows(pdf_bytes: bytes, source_label: str) -> List[PDFRow]:
+    """
+    IMPORTANT: no filtering -> everything is available,
+    user decides what to keep.
+    """
     if not pdf_bytes:
         return []
 
@@ -96,8 +106,10 @@ def extract_pdf_rows(pdf_bytes: bytes, source_label: str) -> List[PDFRow]:
     return rows
 
 
-def _hash_bytes(b: bytes) -> str:
-    return hashlib.sha1(b).hexdigest() if b else ""
+def _hash_bytes(b: Optional[bytes]) -> str:
+    if not b:
+        return ""
+    return hashlib.sha1(b).hexdigest()
 
 
 # =========================================================
@@ -106,12 +118,15 @@ def _hash_bytes(b: bytes) -> str:
 def _draw_header(c: canvas.Canvas, title: str = "") -> float:
     w, h = A4
 
+    # Black band
     c.setFillColorRGB(0.0, 0.0, 0.0)
     c.rect(0, h - 22 * mm, w, 22 * mm, stroke=0, fill=1)
 
+    # Red accent
     c.setFillColorRGB(0.85, 0.0, 0.0)
     c.rect(0, h - 22 * mm, w, 3.5 * mm, stroke=0, fill=1)
 
+    # White text
     c.setFillColorRGB(1.0, 1.0, 1.0)
     c.setFont("Helvetica-Bold", 13)
     c.drawString(12 * mm, h - 14 * mm, "LUCAS ROBOTIC SYSTEM")
@@ -151,6 +166,7 @@ def _draw_table(c: canvas.Canvas, rows: List[PDFRow], y_start: float) -> float:
     col_value = x + w * 0.58
     col_source = x + w * 0.85
 
+    # Header row
     c.setFillColorRGB(0.0, 0.0, 0.0)
     c.setFont("Helvetica-Bold", 9)
     c.drawString(col_label, y, "Variable")
@@ -244,17 +260,18 @@ def render_pdf_lab_panel():
     b1 = pdf1.read()
     b2 = pdf2.read() if pdf2 else None
 
-    # --- session keys: change only when PDF bytes or source name changes ---
-    k1 = f"df_doc1::{_hash_bytes(b1)}::{src1_name}"
-    k2 = f"df_doc2::{_hash_bytes(b2)}::{src2_name}" if b2 else None
-    r1k = f"rows_doc1::{_hash_bytes(b1)}::{src1_name}"
-    r2k = f"rows_doc2::{_hash_bytes(b2)}::{src2_name}" if b2 else None
+    # Session keys: reset only when PDF content or source name changes
+    h1 = _hash_bytes(b1)
+    h2 = _hash_bytes(b2)
+    df1_key = f"pdf_lab::df1::{h1}::{src1_name}"
+    rows1_key = f"pdf_lab::rows1::{h1}::{src1_name}"
+    df2_key = f"pdf_lab::df2::{h2}::{src2_name}"
+    rows2_key = f"pdf_lab::rows2::{h2}::{src2_name}"
 
-    # Initialize only if not present (this fixes "everything unchecks on rerun")
-    if r1k not in st.session_state:
+    if rows1_key not in st.session_state:
         rows1 = extract_pdf_rows(b1, source_label=src1_name)
-        st.session_state[r1k] = rows1
-        st.session_state[k1] = pd.DataFrame([{
+        st.session_state[rows1_key] = rows1
+        st.session_state[df1_key] = pd.DataFrame([{
             "Keep": False,
             "Label": r.label,
             "Value": r.value,
@@ -262,10 +279,10 @@ def render_pdf_lab_panel():
             "_key": r.key,
         } for r in rows1])
 
-    if b2 and r2k not in st.session_state:
+    if b2 and rows2_key not in st.session_state:
         rows2 = extract_pdf_rows(b2, source_label=src2_name)
-        st.session_state[r2k] = rows2
-        st.session_state[k2] = pd.DataFrame([{
+        st.session_state[rows2_key] = rows2
+        st.session_state[df2_key] = pd.DataFrame([{
             "Keep": False,
             "Label": r.label,
             "Value": r.value,
@@ -273,10 +290,14 @@ def render_pdf_lab_panel():
             "_key": r.key,
         } for r in rows2])
 
-    df1 = st.session_state[k1]
-    rows1 = st.session_state[r1k]
-    df2 = st.session_state[k2] if b2 else pd.DataFrame(columns=df1.columns)
-    rows2 = st.session_state[r2k] if b2 else []
+    df1 = st.session_state[df1_key]
+    rows1 = st.session_state[rows1_key]
+    if b2:
+        df2 = st.session_state[df2_key]
+        rows2 = st.session_state[rows2_key]
+    else:
+        df2 = pd.DataFrame(columns=df1.columns)
+        rows2 = []
 
     st.info(f"Detected rows – {src1_name}: {len(df1)} | {src2_name}: {len(df2) if b2 else 0}")
 
@@ -287,15 +308,38 @@ def render_pdf_lab_panel():
         tab_titles.append(f"Document 2 – {src2_name}")
     tabs = st.tabs(tab_titles)
 
+    def _apply_editor_changes(df: pd.DataFrame, edited: pd.DataFrame) -> pd.DataFrame:
+        """Robust update by _key (no pandas magic)."""
+        if edited.empty:
+            return df
+
+        # Map edited rows
+        ed_map = {}
+        for _, r in edited.iterrows():
+            ed_map[str(r["_key"])] = {
+                "Keep": bool(r["Keep"]),
+                "Value": str(r["Value"]),
+            }
+
+        # Apply back to full df
+        for i in range(len(df)):
+            k = str(df.at[i, "_key"])
+            if k in ed_map:
+                df.at[i, "Keep"] = ed_map[k]["Keep"]
+                df.at[i, "Value"] = ed_map[k]["Value"]
+        return df
+
     def editor(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
         show_only_checked = st.toggle(
             "Show only checked (this document)",
             value=False,
-            key=f"{key_prefix}_show_checked"
+            key=f"{key_prefix}_show_checked",
         )
 
+        # Build view from current df (fresh every rerun)
         df_view = df.copy()
 
+        # Search filter
         if search.strip():
             s = search.strip().lower()
             df_view = df_view[
@@ -303,21 +347,40 @@ def render_pdf_lab_panel():
                 | df_view["Value"].astype(str).str.lower().str.contains(s, na=False)
             ]
 
+        # Checked filter
         if show_only_checked:
             df_view = df_view[df_view["Keep"] == True]
             if df_view.empty:
                 st.info("No checked rows in this document yet.")
                 return df
 
-        cA, cB, cC = st.columns([1, 1, 3])
+        # Buttons that apply to the *filtered view*
+        cA, cB, _ = st.columns([1, 1, 6])
         with cA:
-            if st.button("Check all (filtered)", key=f"{key_prefix}_all_on"):
-                df.loc[df_view.index, "Keep"] = True
+            do_check_all = st.button("Check all (filtered)", key=f"{key_prefix}_all_on")
         with cB:
-            if st.button("Uncheck all (filtered)", key=f"{key_prefix}_all_off"):
-                df.loc[df_view.index, "Keep"] = False
+            do_uncheck_all = st.button("Uncheck all (filtered)", key=f"{key_prefix}_all_off")
 
-        # Force rerender of editor when toggling checked/all
+        if do_check_all:
+            df.loc[df_view.index, "Keep"] = True
+        if do_uncheck_all:
+            df.loc[df_view.index, "Keep"] = False
+
+        # Recompute df_view AFTER button actions so UI reflects immediately
+        df_view = df.copy()
+        if search.strip():
+            s = search.strip().lower()
+            df_view = df_view[
+                df_view["Label"].str.lower().str.contains(s, na=False)
+                | df_view["Value"].astype(str).str.lower().str.contains(s, na=False)
+            ]
+        if show_only_checked:
+            df_view = df_view[df_view["Keep"] == True]
+            if df_view.empty:
+                st.info("No checked rows in this document yet.")
+                return df
+
+        # Force rerender when switching all/checked
         editor_key = f"{key_prefix}_editor__{'checked' if show_only_checked else 'all'}"
 
         edited = st.data_editor(
@@ -335,23 +398,20 @@ def render_pdf_lab_panel():
             key=editor_key,
         )
 
-        # Update underlying df using _key (robust)
-        ed = edited.set_index("_key")[["Keep", "Value"]]
-        base = df.set_index("_key")
-        base.update(ed)
-        df[:] = base.reset_index()[df.columns]
-
+        # Apply edits robustly
+        df = _apply_editor_changes(df, edited)
         return df
 
     with tabs[0]:
         df1 = editor(df1, "doc1")
-        st.session_state[k1] = df1
+        st.session_state[df1_key] = df1
 
     if b2:
         with tabs[1]:
             df2 = editor(df2, "doc2")
-            st.session_state[k2] = df2
+            st.session_state[df2_key] = df2
 
+    # Generate output
     if st.button("Generate output PDF", type="primary", key="btn_generate_pdf"):
         selected: List[PDFRow] = []
 
@@ -359,7 +419,7 @@ def render_pdf_lab_panel():
             rows_map = {r.key: r for r in rows}
             checked = df[df["Keep"] == True]
             for _, r in checked.iterrows():
-                obj = rows_map.get(r["_key"])
+                obj = rows_map.get(str(r["_key"]))
                 if obj:
                     obj.value = str(r["Value"])
                     selected.append(obj)
