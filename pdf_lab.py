@@ -25,6 +25,15 @@ class PDFRow:
 
 
 # =========================================================
+# HELPERS
+# =========================================================
+def _hash_bytes(b: Optional[bytes]) -> str:
+    if not b:
+        return ""
+    return hashlib.sha1(b).hexdigest()
+
+
+# =========================================================
 # PDF TEXT EXTRACTION
 # =========================================================
 def _pdf_text(pdf_bytes: bytes) -> str:
@@ -72,10 +81,11 @@ def _parse_pairs_all(text: str) -> List[tuple]:
     return rows
 
 
-def extract_pdf_rows(pdf_bytes: Optional[bytes], source_label: str) -> List[PDFRow]:
+def extract_pdf_rows(pdf_bytes: Optional[bytes], doc_id: str, source_display: str) -> List[PDFRow]:
     """
-    IMPORTANT: no filtering -> everything is available,
-    user decides what to keep.
+    IMPORTANT:
+      - keys are stable and depend ONLY on doc_id + label + counter
+      - source_display is cosmetic and can change without resetting checks
     """
     if not pdf_bytes:
         return []
@@ -94,27 +104,23 @@ def extract_pdf_rows(pdf_bytes: Optional[bytes], source_label: str) -> List[PDFR
 
         base = re.sub(r"\s+", "_", label.lower()).strip("_")
         counter[base] = counter.get(base, 0) + 1
-        key = f"{source_label}::{base}::{counter[base]}"
+
+        # STABLE key (no dependency on display name)
+        key = f"{doc_id}::{base}::{counter[base]}"
 
         rows.append(PDFRow(
             key=key,
             label=label,
             value=value,
-            source=source_label,
+            source=source_display,
             section="main",
         ))
 
     return rows
 
 
-def _hash_bytes(b: Optional[bytes]) -> str:
-    if not b:
-        return ""
-    return hashlib.sha1(b).hexdigest()
-
-
 # =========================================================
-# PDF GENERATION (REPORTLAB)
+# PDF GENERATION (REPORTLAB) - includes page2+ visibility fix
 # =========================================================
 def _draw_header(c: canvas.Canvas, title: str = "") -> float:
     w, h = A4
@@ -127,7 +133,7 @@ def _draw_header(c: canvas.Canvas, title: str = "") -> float:
     c.setFillColorRGB(0.85, 0.0, 0.0)
     c.rect(0, h - 22 * mm, w, 3.5 * mm, stroke=0, fill=1)
 
-    # White text in header
+    # White header text
     c.setFillColorRGB(1.0, 1.0, 1.0)
     c.setFont("Helvetica-Bold", 13)
     c.drawString(12 * mm, h - 14 * mm, "LUCAS ROBOTIC SYSTEM")
@@ -138,7 +144,6 @@ def _draw_header(c: canvas.Canvas, title: str = "") -> float:
         right = f"{right}  –  {title}"
     c.drawRightString(w - 12 * mm, h - 14 * mm, right)
 
-    # IMPORTANT: do NOT assume fill color after header; caller must reset.
     return h - 28 * mm
 
 
@@ -160,7 +165,7 @@ def _wrap_simple(text: str, max_chars: int) -> List[str]:
 
 
 def _draw_table_header(c: canvas.Canvas, col_label: float, col_value: float, col_source: float, y: float) -> float:
-    # Ensure black text (critical, esp. after drawing header which uses white)
+    # CRITICAL: reset to black text after header (header uses white)
     c.setFillColorRGB(0.0, 0.0, 0.0)
     c.setFont("Helvetica-Bold", 9)
     c.drawString(col_label, y, "Variable")
@@ -187,7 +192,6 @@ def _draw_table(c: canvas.Canvas, rows: List[PDFRow], y_start: float) -> float:
     col_value = x + w * 0.58
     col_source = x + w * 0.85
 
-    # First page table header
     y = _draw_table_header(c, col_label, col_value, col_source, y)
 
     for r in rows:
@@ -199,11 +203,8 @@ def _draw_table(c: canvas.Canvas, rows: List[PDFRow], y_start: float) -> float:
         if y - row_h < 15 * mm:
             c.showPage()
             y = _draw_header(c, title="")
-
-            # CRITICAL FIX: after header, reset text color to black
             y = _draw_table_header(c, col_label, col_value, col_source, y)
 
-        # Ensure black text for row (extra safety)
         c.setFillColorRGB(0.0, 0.0, 0.0)
         c.setFont("Helvetica", 9)
 
@@ -221,10 +222,8 @@ def _draw_table(c: canvas.Canvas, rows: List[PDFRow], y_start: float) -> float:
 def build_output_pdf(selected_rows: List[PDFRow]) -> bytes:
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
-
     y = _draw_header(c, title="")
     _draw_table(c, selected_rows, y)
-
     c.save()
     return buf.getvalue()
 
@@ -268,16 +267,22 @@ def render_pdf_lab_panel():
     b1 = pdf1.read()
     b2 = pdf2.read() if pdf2 else None
 
+    # Stable doc ids based ONLY on pdf hash
     h1 = _hash_bytes(b1)
     h2 = _hash_bytes(b2)
+    doc1_id = f"doc1::{h1}"
+    doc2_id = f"doc2::{h2}" if b2 else ""
 
-    df1_key = f"pdf_lab::df1::{h1}::{src1_name}"
-    rows1_key = f"pdf_lab::rows1::{h1}::{src1_name}"
-    df2_key = f"pdf_lab::df2::{h2}::{src2_name}"
-    rows2_key = f"pdf_lab::rows2::{h2}::{src2_name}"
+    # session keys depend ONLY on pdf hash (never on display names)
+    rows1_key = f"pdf_lab::rows::{doc1_id}"
+    df1_key = f"pdf_lab::df::{doc1_id}"
 
+    rows2_key = f"pdf_lab::rows::{doc2_id}"
+    df2_key = f"pdf_lab::df::{doc2_id}"
+
+    # Initialize doc1 once per PDF
     if rows1_key not in st.session_state:
-        rows1 = extract_pdf_rows(b1, source_label=src1_name)
+        rows1 = extract_pdf_rows(b1, doc_id=doc1_id, source_display=src1_name)
         st.session_state[rows1_key] = rows1
         st.session_state[df1_key] = pd.DataFrame([{
             "Keep": False,
@@ -287,8 +292,9 @@ def render_pdf_lab_panel():
             "_key": r.key,
         } for r in rows1])
 
+    # Initialize doc2 once per PDF
     if b2 and rows2_key not in st.session_state:
-        rows2 = extract_pdf_rows(b2, source_label=src2_name)
+        rows2 = extract_pdf_rows(b2, doc_id=doc2_id, source_display=src2_name)
         st.session_state[rows2_key] = rows2
         st.session_state[df2_key] = pd.DataFrame([{
             "Keep": False,
@@ -300,12 +306,23 @@ def render_pdf_lab_panel():
 
     df1 = st.session_state[df1_key]
     rows1 = st.session_state[rows1_key]
+
     if b2:
         df2 = st.session_state[df2_key]
         rows2 = st.session_state[rows2_key]
     else:
         df2 = pd.DataFrame(columns=df1.columns)
         rows2 = []
+
+    # Cosmetic rename must update "Source" column + rows[].source without resetting checks
+    df1["Source"] = src1_name
+    for r in rows1:
+        r.source = src1_name
+
+    if b2:
+        df2["Source"] = src2_name
+        for r in rows2:
+            r.source = src2_name
 
     st.info(f"Detected rows – {src1_name}: {len(df1)} | {src2_name}: {len(df2) if b2 else 0}")
 
@@ -338,7 +355,9 @@ def render_pdf_lab_panel():
             key=f"{key_prefix}_show_checked",
         )
 
+        # view from df
         df_view = df.copy()
+
         if search.strip():
             s = search.strip().lower()
             df_view = df_view[
@@ -352,6 +371,7 @@ def render_pdf_lab_panel():
                 st.info("No checked rows in this document yet.")
                 return df
 
+        # Buttons apply to filtered view
         cA, cB, _ = st.columns([1, 1, 6])
         with cA:
             do_check_all = st.button("Check all (filtered)", key=f"{key_prefix}_all_on")
@@ -363,7 +383,7 @@ def render_pdf_lab_panel():
         if do_uncheck_all:
             df.loc[df_view.index, "Keep"] = False
 
-        # Recompute view after button actions
+        # rebuild view after button actions
         df_view = df.copy()
         if search.strip():
             s = search.strip().lower()
@@ -377,10 +397,9 @@ def render_pdf_lab_panel():
                 st.info("No checked rows in this document yet.")
                 return df
 
-        # Force rerender when toggling checked/all
+        # force rerender on toggle state
         editor_key = f"{key_prefix}_editor__{'checked' if show_only_checked else 'all'}"
 
-        # No disabled=True (avoids invisible cells)
         edited = st.data_editor(
             df_view[["Keep", "Label", "Value", "Source", "_key"]],
             use_container_width=True,
@@ -418,6 +437,7 @@ def render_pdf_lab_panel():
                 obj = rows_map.get(str(r["_key"]))
                 if obj:
                     obj.value = str(r["Value"])
+                    obj.source = str(r["Source"])
                     selected.append(obj)
 
         collect(df1, rows1)
