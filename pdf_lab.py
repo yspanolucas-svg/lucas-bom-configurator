@@ -57,7 +57,6 @@ def _parse_pairs_all(text: str) -> List[tuple]:
             continue
 
         # Common: label + numeric chunk at end
-        # "Robot weight 250.0 kg" => ("Robot weight", "250.0 kg")
         m2 = re.match(r"^(.*?)([-+]?\d[\d.,]*\s*.*)$", line)
         if m2 and len(m2.group(1).strip()) >= 3:
             rows.append((m2.group(1).strip(), m2.group(2).strip()))
@@ -128,7 +127,7 @@ def _draw_header(c: canvas.Canvas, title: str = "") -> float:
     c.setFillColorRGB(0.85, 0.0, 0.0)
     c.rect(0, h - 22 * mm, w, 3.5 * mm, stroke=0, fill=1)
 
-    # White text
+    # White text in header
     c.setFillColorRGB(1.0, 1.0, 1.0)
     c.setFont("Helvetica-Bold", 13)
     c.drawString(12 * mm, h - 14 * mm, "LUCAS ROBOTIC SYSTEM")
@@ -139,6 +138,7 @@ def _draw_header(c: canvas.Canvas, title: str = "") -> float:
         right = f"{right}  –  {title}"
     c.drawRightString(w - 12 * mm, h - 14 * mm, right)
 
+    # IMPORTANT: do NOT assume fill color after header; caller must reset.
     return h - 28 * mm
 
 
@@ -159,16 +159,8 @@ def _wrap_simple(text: str, max_chars: int) -> List[str]:
     return lines or [""]
 
 
-def _draw_table(c: canvas.Canvas, rows: List[PDFRow], y_start: float) -> float:
-    x = 12 * mm
-    w = A4[0] - 24 * mm
-    y = y_start
-
-    col_label = x
-    col_value = x + w * 0.58
-    col_source = x + w * 0.85
-
-    # Header row
+def _draw_table_header(c: canvas.Canvas, col_label: float, col_value: float, col_source: float, y: float) -> float:
+    # Ensure black text (critical, esp. after drawing header which uses white)
     c.setFillColorRGB(0.0, 0.0, 0.0)
     c.setFont("Helvetica-Bold", 9)
     c.drawString(col_label, y, "Variable")
@@ -178,11 +170,25 @@ def _draw_table(c: canvas.Canvas, rows: List[PDFRow], y_start: float) -> float:
 
     c.setStrokeColorRGB(0.7, 0.7, 0.7)
     c.setLineWidth(0.4)
-    c.line(x, y, x + w, y)
+    c.line(col_label, y, (A4[0] - 12 * mm), y)
     y -= 4 * mm
 
     c.setFont("Helvetica", 9)
     c.setFillColorRGB(0.0, 0.0, 0.0)
+    return y
+
+
+def _draw_table(c: canvas.Canvas, rows: List[PDFRow], y_start: float) -> float:
+    x = 12 * mm
+    w = A4[0] - 24 * mm
+    y = y_start
+
+    col_label = x
+    col_value = x + w * 0.58
+    col_source = x + w * 0.85
+
+    # First page table header
+    y = _draw_table_header(c, col_label, col_value, col_source, y)
 
     for r in rows:
         lab_lines = _wrap_simple(r.label, 55)
@@ -193,15 +199,13 @@ def _draw_table(c: canvas.Canvas, rows: List[PDFRow], y_start: float) -> float:
         if y - row_h < 15 * mm:
             c.showPage()
             y = _draw_header(c, title="")
-            c.setFont("Helvetica-Bold", 9)
-            c.drawString(col_label, y, "Variable")
-            c.drawString(col_value, y, "Value")
-            c.drawString(col_source, y, "Source")
-            y -= 4 * mm
-            c.setStrokeColorRGB(0.7, 0.7, 0.7)
-            c.line(x, y, x + w, y)
-            y -= 4 * mm
-            c.setFont("Helvetica", 9)
+
+            # CRITICAL FIX: after header, reset text color to black
+            y = _draw_table_header(c, col_label, col_value, col_source, y)
+
+        # Ensure black text for row (extra safety)
+        c.setFillColorRGB(0.0, 0.0, 0.0)
+        c.setFont("Helvetica", 9)
 
         for i in range(n):
             c.drawString(col_label, y - i * 4.2 * mm, lab_lines[i] if i < len(lab_lines) else "")
@@ -217,8 +221,10 @@ def _draw_table(c: canvas.Canvas, rows: List[PDFRow], y_start: float) -> float:
 def build_output_pdf(selected_rows: List[PDFRow]) -> bytes:
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
+
     y = _draw_header(c, title="")
     _draw_table(c, selected_rows, y)
+
     c.save()
     return buf.getvalue()
 
@@ -262,17 +268,14 @@ def render_pdf_lab_panel():
     b1 = pdf1.read()
     b2 = pdf2.read() if pdf2 else None
 
-    # Session keys: reset only when PDF content or source name changes
     h1 = _hash_bytes(b1)
     h2 = _hash_bytes(b2)
 
     df1_key = f"pdf_lab::df1::{h1}::{src1_name}"
     rows1_key = f"pdf_lab::rows1::{h1}::{src1_name}"
-
     df2_key = f"pdf_lab::df2::{h2}::{src2_name}"
     rows2_key = f"pdf_lab::rows2::{h2}::{src2_name}"
 
-    # Init doc1
     if rows1_key not in st.session_state:
         rows1 = extract_pdf_rows(b1, source_label=src1_name)
         st.session_state[rows1_key] = rows1
@@ -284,7 +287,6 @@ def render_pdf_lab_panel():
             "_key": r.key,
         } for r in rows1])
 
-    # Init doc2
     if b2 and rows2_key not in st.session_state:
         rows2 = extract_pdf_rows(b2, source_label=src2_name)
         st.session_state[rows2_key] = rows2
@@ -315,23 +317,18 @@ def render_pdf_lab_panel():
     tabs = st.tabs(tab_titles)
 
     def _apply_editor_changes(df: pd.DataFrame, edited: pd.DataFrame) -> pd.DataFrame:
-        """Robust update by _key (no pandas update magic)."""
         if edited is None or edited.empty:
             return df
 
         ed_map = {}
         for _, r in edited.iterrows():
-            ed_map[str(r["_key"])] = {
-                "Keep": bool(r["Keep"]),
-                "Value": str(r["Value"]),
-            }
+            ed_map[str(r["_key"])] = {"Keep": bool(r["Keep"]), "Value": str(r["Value"])}
 
         for i in range(len(df)):
             k = str(df.at[i, "_key"])
             if k in ed_map:
                 df.at[i, "Keep"] = ed_map[k]["Keep"]
                 df.at[i, "Value"] = ed_map[k]["Value"]
-
         return df
 
     def editor(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
@@ -341,9 +338,7 @@ def render_pdf_lab_panel():
             key=f"{key_prefix}_show_checked",
         )
 
-        # Build view from df
         df_view = df.copy()
-
         if search.strip():
             s = search.strip().lower()
             df_view = df_view[
@@ -357,7 +352,6 @@ def render_pdf_lab_panel():
                 st.info("No checked rows in this document yet.")
                 return df
 
-        # Buttons apply to filtered view
         cA, cB, _ = st.columns([1, 1, 6])
         with cA:
             do_check_all = st.button("Check all (filtered)", key=f"{key_prefix}_all_on")
@@ -369,7 +363,7 @@ def render_pdf_lab_panel():
         if do_uncheck_all:
             df.loc[df_view.index, "Keep"] = False
 
-        # Recompute view after button actions so UI updates immediately
+        # Recompute view after button actions
         df_view = df.copy()
         if search.strip():
             s = search.strip().lower()
@@ -383,10 +377,10 @@ def render_pdf_lab_panel():
                 st.info("No checked rows in this document yet.")
                 return df
 
-        # Force rerender when switching all/checked (Streamlit state)
+        # Force rerender when toggling checked/all
         editor_key = f"{key_prefix}_editor__{'checked' if show_only_checked else 'all'}"
 
-        # IMPORTANT: no disabled=True -> avoids invisible blocks
+        # No disabled=True (avoids invisible cells)
         edited = st.data_editor(
             df_view[["Keep", "Label", "Value", "Source", "_key"]],
             use_container_width=True,
@@ -414,7 +408,6 @@ def render_pdf_lab_panel():
             df2 = editor(df2, "doc2")
             st.session_state[df2_key] = df2
 
-    # Generate output
     if st.button("Generate output PDF", type="primary", key="btn_generate_pdf"):
         selected: List[PDFRow] = []
 
