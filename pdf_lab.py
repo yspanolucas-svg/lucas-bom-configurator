@@ -20,7 +20,7 @@ class PDFRow:
     label: str
     value: str
     source: str
-    section: str  # "main" for now
+    section: str  # "main" (on reste simple pour l’instant)
 
 
 # =========================================================
@@ -38,10 +38,12 @@ def _pdf_text(pdf_bytes: bytes) -> str:
 
 def _parse_pairs_all(text: str) -> List[tuple]:
     """
-    Parse table-like lines.
-    Handles:
-      - "Label  Value" (double spaces)
-      - "Robot weight 250.0 kg" (single-space export)
+    Parse large tables that appear as:
+        Robot brand ABB
+        Maximum speed on the y-axis 0.5 m/s
+    Many PDFs from CADENAS export lines as single-space separated.
+    We split into (label, value) by taking last "value-ish" chunk.
+    Fallback: try double-spaces first.
     """
     rows = []
     for raw in text.splitlines():
@@ -49,19 +51,20 @@ def _parse_pairs_all(text: str) -> List[tuple]:
         if not line:
             continue
 
-        # Prefer: "Label  Value"
+        # prefer "Label  Value"
         m = re.match(r"^(.*?)[ ]{2,}(.+)$", line)
         if m:
             rows.append((m.group(1).strip(), m.group(2).strip()))
             continue
 
-        # Common: "Label 250.0 kg" (numeric chunk at end)
+        # else: attempt split by last numeric/unit occurrence
+        # Example: "Robot weight 250.0 kg" => label="Robot weight", value="250.0 kg"
         m2 = re.match(r"^(.*?)([-+]?\d[\d.,]*\s*.*)$", line)
         if m2 and len(m2.group(1).strip()) >= 3:
             rows.append((m2.group(1).strip(), m2.group(2).strip()))
             continue
 
-        # Fallback: last token as value
+        # else: try split at last word (not perfect, but better than dropping)
         parts = line.split(" ")
         if len(parts) >= 2:
             rows.append((" ".join(parts[:-1]).strip(), parts[-1].strip()))
@@ -73,12 +76,9 @@ def _parse_pairs_all(text: str) -> List[tuple]:
 
 def extract_pdf_rows(pdf_bytes: bytes, source_label: str) -> List[PDFRow]:
     """
-    IMPORTANT: no filtering -> everything is available in UI,
-    and user selects what to keep.
+    IMPORTANT: on ne filtre rien -> tout remonte.
+    Tout est décoché par défaut côté UI.
     """
-    if not pdf_bytes:
-        return []
-
     text = _pdf_text(pdf_bytes)
     pairs = _parse_pairs_all(text)
 
@@ -297,7 +297,6 @@ def render_pdf_lab_panel():
 
         df_view = df.copy()
 
-        # search
         if search.strip():
             s = search.strip().lower()
             df_view = df_view[
@@ -305,14 +304,9 @@ def render_pdf_lab_panel():
                 | df_view["Value"].astype(str).str.lower().str.contains(s, na=False)
             ]
 
-        # filter checked
         if show_only_checked:
             df_view = df_view[df_view["Keep"] == True]
-            if df_view.empty:
-                st.info("No checked rows in this document yet.")
-                return df
 
-        # Buttons apply to filtered view (practical)
         cA, cB, cC = st.columns([1, 1, 3])
         with cA:
             if st.button("Check all (filtered)", key=f"{key_prefix}_all_on"):
@@ -322,9 +316,6 @@ def render_pdf_lab_panel():
             if st.button("Uncheck all (filtered)", key=f"{key_prefix}_all_off"):
                 df.loc[df_view.index, "Keep"] = False
                 df_view["Keep"] = False
-
-        # IMPORTANT FIX: force data_editor rerender by changing key depending on toggle state
-        editor_key = f"{key_prefix}_editor__{'checked' if show_only_checked else 'all'}"
 
         edited = st.data_editor(
             df_view[["Keep", "Label", "Value", "Source", "_key"]],
@@ -338,7 +329,7 @@ def render_pdf_lab_panel():
                 "Source": st.column_config.TextColumn("Source", disabled=True, width="medium"),
                 "_key": st.column_config.TextColumn("_key", disabled=True, width="small"),
             },
-            key=editor_key,
+            key=f"{key_prefix}_editor",
         )
 
         # reinject edits into original df via _key
@@ -362,6 +353,7 @@ def render_pdf_lab_panel():
     if st.button("Generate output PDF", type="primary", key="btn_generate_pdf"):
         selected: List[PDFRow] = []
 
+        # Apply overrides & select by Keep
         def collect(df: pd.DataFrame, rows: List[PDFRow]):
             rows_map = {r.key: r for r in rows}
             for _, r in df.iterrows():
@@ -375,7 +367,6 @@ def render_pdf_lab_panel():
         collect(df2, rows2)
 
         out = build_output_pdf(selected)
-
         st.download_button(
             "💾 Download PDF",
             data=out,
