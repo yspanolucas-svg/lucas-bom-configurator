@@ -42,6 +42,7 @@ def _parse_pairs_all(text: str) -> List[tuple]:
     Handles:
       - "Label  Value" (double spaces)
       - "Robot weight 250.0 kg" (single-space export)
+      - fallback: last token as value
     """
     rows = []
     for raw in text.splitlines():
@@ -56,6 +57,7 @@ def _parse_pairs_all(text: str) -> List[tuple]:
             continue
 
         # Common: label + numeric chunk at end
+        # "Robot weight 250.0 kg" => ("Robot weight", "250.0 kg")
         m2 = re.match(r"^(.*?)([-+]?\d[\d.,]*\s*.*)$", line)
         if m2 and len(m2.group(1).strip()) >= 3:
             rows.append((m2.group(1).strip(), m2.group(2).strip()))
@@ -71,7 +73,7 @@ def _parse_pairs_all(text: str) -> List[tuple]:
     return rows
 
 
-def extract_pdf_rows(pdf_bytes: bytes, source_label: str) -> List[PDFRow]:
+def extract_pdf_rows(pdf_bytes: Optional[bytes], source_label: str) -> List[PDFRow]:
     """
     IMPORTANT: no filtering -> everything is available,
     user decides what to keep.
@@ -263,11 +265,14 @@ def render_pdf_lab_panel():
     # Session keys: reset only when PDF content or source name changes
     h1 = _hash_bytes(b1)
     h2 = _hash_bytes(b2)
+
     df1_key = f"pdf_lab::df1::{h1}::{src1_name}"
     rows1_key = f"pdf_lab::rows1::{h1}::{src1_name}"
+
     df2_key = f"pdf_lab::df2::{h2}::{src2_name}"
     rows2_key = f"pdf_lab::rows2::{h2}::{src2_name}"
 
+    # Init doc1
     if rows1_key not in st.session_state:
         rows1 = extract_pdf_rows(b1, source_label=src1_name)
         st.session_state[rows1_key] = rows1
@@ -279,6 +284,7 @@ def render_pdf_lab_panel():
             "_key": r.key,
         } for r in rows1])
 
+    # Init doc2
     if b2 and rows2_key not in st.session_state:
         rows2 = extract_pdf_rows(b2, source_label=src2_name)
         st.session_state[rows2_key] = rows2
@@ -309,11 +315,10 @@ def render_pdf_lab_panel():
     tabs = st.tabs(tab_titles)
 
     def _apply_editor_changes(df: pd.DataFrame, edited: pd.DataFrame) -> pd.DataFrame:
-        """Robust update by _key (no pandas magic)."""
-        if edited.empty:
+        """Robust update by _key (no pandas update magic)."""
+        if edited is None or edited.empty:
             return df
 
-        # Map edited rows
         ed_map = {}
         for _, r in edited.iterrows():
             ed_map[str(r["_key"])] = {
@@ -321,12 +326,12 @@ def render_pdf_lab_panel():
                 "Value": str(r["Value"]),
             }
 
-        # Apply back to full df
         for i in range(len(df)):
             k = str(df.at[i, "_key"])
             if k in ed_map:
                 df.at[i, "Keep"] = ed_map[k]["Keep"]
                 df.at[i, "Value"] = ed_map[k]["Value"]
+
         return df
 
     def editor(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
@@ -336,10 +341,9 @@ def render_pdf_lab_panel():
             key=f"{key_prefix}_show_checked",
         )
 
-        # Build view from current df (fresh every rerun)
+        # Build view from df
         df_view = df.copy()
 
-        # Search filter
         if search.strip():
             s = search.strip().lower()
             df_view = df_view[
@@ -347,14 +351,13 @@ def render_pdf_lab_panel():
                 | df_view["Value"].astype(str).str.lower().str.contains(s, na=False)
             ]
 
-        # Checked filter
         if show_only_checked:
             df_view = df_view[df_view["Keep"] == True]
             if df_view.empty:
                 st.info("No checked rows in this document yet.")
                 return df
 
-        # Buttons that apply to the *filtered view*
+        # Buttons apply to filtered view
         cA, cB, _ = st.columns([1, 1, 6])
         with cA:
             do_check_all = st.button("Check all (filtered)", key=f"{key_prefix}_all_on")
@@ -366,7 +369,7 @@ def render_pdf_lab_panel():
         if do_uncheck_all:
             df.loc[df_view.index, "Keep"] = False
 
-        # Recompute df_view AFTER button actions so UI reflects immediately
+        # Recompute view after button actions so UI updates immediately
         df_view = df.copy()
         if search.strip():
             s = search.strip().lower()
@@ -380,9 +383,10 @@ def render_pdf_lab_panel():
                 st.info("No checked rows in this document yet.")
                 return df
 
-        # Force rerender when switching all/checked
+        # Force rerender when switching all/checked (Streamlit state)
         editor_key = f"{key_prefix}_editor__{'checked' if show_only_checked else 'all'}"
 
+        # IMPORTANT: no disabled=True -> avoids invisible blocks
         edited = st.data_editor(
             df_view[["Keep", "Label", "Value", "Source", "_key"]],
             use_container_width=True,
@@ -390,15 +394,14 @@ def render_pdf_lab_panel():
             height=900,
             column_config={
                 "Keep": st.column_config.CheckboxColumn("Keep", default=False, width="small"),
-                "Label": st.column_config.TextColumn("Label", disabled=True, width="large"),
+                "Label": st.column_config.TextColumn("Label", width="large"),
                 "Value": st.column_config.TextColumn("Value", width="large"),
-                "Source": st.column_config.TextColumn("Source", disabled=True, width="medium"),
-                "_key": st.column_config.TextColumn("_key", disabled=True, width="small"),
+                "Source": st.column_config.TextColumn("Source", width="medium"),
+                "_key": st.column_config.TextColumn("_key", width="small"),
             },
             key=editor_key,
         )
 
-        # Apply edits robustly
         df = _apply_editor_changes(df, edited)
         return df
 
