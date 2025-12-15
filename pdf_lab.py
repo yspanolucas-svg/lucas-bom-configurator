@@ -1,4 +1,5 @@
 import io
+import os
 import re
 import hashlib
 from dataclasses import dataclass
@@ -31,6 +32,45 @@ def _hash_bytes(b: Optional[bytes]) -> str:
     if not b:
         return ""
     return hashlib.sha1(b).hexdigest()
+
+
+def _norm_label(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s).strip().lower())
+
+
+# =========================================================
+# PRESET (from repo)
+# =========================================================
+def load_fusion_preset_labels_from_repo(preset_path: str = "presets/fusion_default.csv") -> set[str]:
+    """
+    Load preset labels from repo (no user upload).
+    Expected CSV format:
+      label
+      Maximum speed on the y-axis
+      ...
+    """
+    if not os.path.exists(preset_path):
+        return set()
+
+    df = pd.read_csv(preset_path)
+    if "label" not in df.columns:
+        return set()
+
+    return set(df["label"].dropna().apply(_norm_label))
+
+
+def apply_fusion_presets_from_repo(df: pd.DataFrame, preset_labels: set[str]) -> pd.DataFrame:
+    """
+    Pre-check rows based on exact label match (normalized).
+    Applies only Keep=True; doesn't touch Value.
+    """
+    if df is None or df.empty or not preset_labels:
+        return df
+
+    labels_norm = df["Label"].astype(str).apply(_norm_label)
+    mask = labels_norm.isin(preset_labels)
+    df.loc[mask, "Keep"] = True
+    return df
 
 
 # =========================================================
@@ -83,9 +123,8 @@ def _parse_pairs_all(text: str) -> List[tuple]:
 
 def extract_pdf_rows(pdf_bytes: Optional[bytes], doc_id: str, source_display: str) -> List[PDFRow]:
     """
-    IMPORTANT:
-      - keys are stable and depend ONLY on doc_id + label + counter
-      - source_display is cosmetic and can change without resetting checks
+    Keys are stable and depend ONLY on doc_id + label + counter.
+    source_display is cosmetic.
     """
     if not pdf_bytes:
         return []
@@ -104,8 +143,6 @@ def extract_pdf_rows(pdf_bytes: Optional[bytes], doc_id: str, source_display: st
 
         base = re.sub(r"\s+", "_", label.lower()).strip("_")
         counter[base] = counter.get(base, 0) + 1
-
-        # STABLE key (no dependency on display name)
         key = f"{doc_id}::{base}::{counter[base]}"
 
         rows.append(PDFRow(
@@ -120,20 +157,17 @@ def extract_pdf_rows(pdf_bytes: Optional[bytes], doc_id: str, source_display: st
 
 
 # =========================================================
-# PDF GENERATION (REPORTLAB) - includes page2+ visibility fix
+# PDF GENERATION (REPORTLAB) - page 2+ visibility fix
 # =========================================================
 def _draw_header(c: canvas.Canvas, title: str = "") -> float:
     w, h = A4
 
-    # Black band
     c.setFillColorRGB(0.0, 0.0, 0.0)
     c.rect(0, h - 22 * mm, w, 22 * mm, stroke=0, fill=1)
 
-    # Red accent
     c.setFillColorRGB(0.85, 0.0, 0.0)
     c.rect(0, h - 22 * mm, w, 3.5 * mm, stroke=0, fill=1)
 
-    # White header text
     c.setFillColorRGB(1.0, 1.0, 1.0)
     c.setFont("Helvetica-Bold", 13)
     c.drawString(12 * mm, h - 14 * mm, "LUCAS ROBOTIC SYSTEM")
@@ -165,7 +199,7 @@ def _wrap_simple(text: str, max_chars: int) -> List[str]:
 
 
 def _draw_table_header(c: canvas.Canvas, col_label: float, col_value: float, col_source: float, y: float) -> float:
-    # CRITICAL: reset to black text after header (header uses white)
+    # critical: reset black after header (header uses white)
     c.setFillColorRGB(0.0, 0.0, 0.0)
     c.setFont("Helvetica-Bold", 9)
     c.drawString(col_label, y, "Variable")
@@ -267,20 +301,18 @@ def render_pdf_lab_panel():
     b1 = pdf1.read()
     b2 = pdf2.read() if pdf2 else None
 
-    # Stable doc ids based ONLY on pdf hash
+    # stable doc ids based ONLY on pdf hashes
     h1 = _hash_bytes(b1)
     h2 = _hash_bytes(b2)
     doc1_id = f"doc1::{h1}"
     doc2_id = f"doc2::{h2}" if b2 else ""
 
-    # session keys depend ONLY on pdf hash (never on display names)
     rows1_key = f"pdf_lab::rows::{doc1_id}"
     df1_key = f"pdf_lab::df::{doc1_id}"
-
     rows2_key = f"pdf_lab::rows::{doc2_id}"
     df2_key = f"pdf_lab::df::{doc2_id}"
 
-    # Initialize doc1 once per PDF
+    # init doc1 once per PDF
     if rows1_key not in st.session_state:
         rows1 = extract_pdf_rows(b1, doc_id=doc1_id, source_display=src1_name)
         st.session_state[rows1_key] = rows1
@@ -292,7 +324,7 @@ def render_pdf_lab_panel():
             "_key": r.key,
         } for r in rows1])
 
-    # Initialize doc2 once per PDF
+    # init doc2 once per PDF
     if b2 and rows2_key not in st.session_state:
         rows2 = extract_pdf_rows(b2, doc_id=doc2_id, source_display=src2_name)
         st.session_state[rows2_key] = rows2
@@ -306,7 +338,6 @@ def render_pdf_lab_panel():
 
     df1 = st.session_state[df1_key]
     rows1 = st.session_state[rows1_key]
-
     if b2:
         df2 = st.session_state[df2_key]
         rows2 = st.session_state[rows2_key]
@@ -314,7 +345,7 @@ def render_pdf_lab_panel():
         df2 = pd.DataFrame(columns=df1.columns)
         rows2 = []
 
-    # Cosmetic rename must update "Source" column + rows[].source without resetting checks
+    # Cosmetic rename only (no reset)
     df1["Source"] = src1_name
     for r in rows1:
         r.source = src1_name
@@ -323,6 +354,19 @@ def render_pdf_lab_panel():
         df2["Source"] = src2_name
         for r in rows2:
             r.source = src2_name
+
+    # ---------------------------------------------------------
+    # AUTO PRESET (Fusion only, apply once per pair of PDFs)
+    # ---------------------------------------------------------
+    if mode == "Assemble (2 PDFs)":
+        preset_labels = load_fusion_preset_labels_from_repo("presets/fusion_default.csv")
+        preset_applied_key = f"pdf_lab::fusion_preset_applied::{h1}::{h2}"
+        if preset_labels and preset_applied_key not in st.session_state:
+            df1 = apply_fusion_presets_from_repo(df1, preset_labels)
+            df2 = apply_fusion_presets_from_repo(df2, preset_labels)
+            st.session_state[df1_key] = df1
+            st.session_state[df2_key] = df2
+            st.session_state[preset_applied_key] = True
 
     st.info(f"Detected rows – {src1_name}: {len(df1)} | {src2_name}: {len(df2) if b2 else 0}")
 
@@ -355,9 +399,7 @@ def render_pdf_lab_panel():
             key=f"{key_prefix}_show_checked",
         )
 
-        # view from df
         df_view = df.copy()
-
         if search.strip():
             s = search.strip().lower()
             df_view = df_view[
@@ -371,7 +413,6 @@ def render_pdf_lab_panel():
                 st.info("No checked rows in this document yet.")
                 return df
 
-        # Buttons apply to filtered view
         cA, cB, _ = st.columns([1, 1, 6])
         with cA:
             do_check_all = st.button("Check all (filtered)", key=f"{key_prefix}_all_on")
@@ -397,7 +438,6 @@ def render_pdf_lab_panel():
                 st.info("No checked rows in this document yet.")
                 return df
 
-        # force rerender on toggle state
         editor_key = f"{key_prefix}_editor__{'checked' if show_only_checked else 'all'}"
 
         edited = st.data_editor(
