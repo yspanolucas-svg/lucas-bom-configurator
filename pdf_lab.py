@@ -3,7 +3,7 @@ import os
 import re
 import hashlib
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict
 
 import pandas as pd
 import streamlit as st
@@ -14,7 +14,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 
 from docx import Document  # python-docx
-from docx.shared import Pt, Mm, RGBColor
+from docx.shared import Pt, RGBColor
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -111,11 +111,11 @@ def _pdf_text(pdf_bytes: bytes) -> str:
 
 def _parse_pairs_all(text: str) -> List[tuple]:
     """
-    Parse table-like lines.
-    Handles:
-      - "Label  Value" (double spaces)
-      - "Robot weight 250.0 kg" (single-space export)
-      - fallback: last token as value
+    Parse des lignes de tableau.
+    Gère :
+      - "Libellé  Valeur" (double espaces)
+      - "Robot weight 250.0 kg" (un seul espace)
+      - fallback : dernier token = valeur
     """
     rows = []
     for raw in text.splitlines():
@@ -123,19 +123,19 @@ def _parse_pairs_all(text: str) -> List[tuple]:
         if not line:
             continue
 
-        # Prefer: "Label  Value"
+        # Priorité : "Label  Value"
         m = re.match(r"^(.*?)[ ]{2,}(.+)$", line)
         if m:
             rows.append((m.group(1).strip(), m.group(2).strip()))
             continue
 
-        # Common: label + numeric chunk at end
+        # Souvent : label + numérique à la fin
         m2 = re.match(r"^(.*?)([-+]?\d[\d.,]*\s*.*)$", line)
         if m2 and len(m2.group(1).strip()) >= 3:
             rows.append((m2.group(1).strip(), m2.group(2).strip()))
             continue
 
-        # fallback: last token as value
+        # fallback
         parts = line.split(" ")
         if len(parts) >= 2:
             rows.append((" ".join(parts[:-1]).strip(), parts[-1].strip()))
@@ -147,8 +147,8 @@ def _parse_pairs_all(text: str) -> List[tuple]:
 
 def extract_pdf_rows(pdf_bytes: Optional[bytes], doc_id: str, source_display: str) -> List[PDFRow]:
     """
-    Keys are stable and depend ONLY on doc_id + label + counter.
-    source_display is cosmetic.
+    Keys stables basés sur doc_id + label + compteur.
+    source_display = nom utilisateur (Ensemble 1 / Ensemble 2).
     """
     if not pdf_bytes:
         return []
@@ -181,26 +181,26 @@ def extract_pdf_rows(pdf_bytes: Optional[bytes], doc_id: str, source_display: st
 
 
 # =========================================================
-# OUTPUT PDF (REPORTLAB) - Lucas banner + multi-page visible text
+# OUTPUT PDF (REPORTLAB) - bandeau Lucas + multi-pages lisibles
 # =========================================================
 def _draw_header_pdf(c: canvas.Canvas, title: str = "") -> float:
     w, h = A4
 
-    # Black band
+    # Bandeau noir
     c.setFillColorRGB(0.0, 0.0, 0.0)
     c.rect(0, h - 22 * mm, w, 22 * mm, stroke=0, fill=1)
 
-    # Red stripe
+    # Liseré rouge
     c.setFillColorRGB(0.85, 0.0, 0.0)
     c.rect(0, h - 22 * mm, w, 3.5 * mm, stroke=0, fill=1)
 
-    # White text
+    # Texte blanc
     c.setFillColorRGB(1.0, 1.0, 1.0)
     c.setFont("Helvetica-Bold", 13)
     c.drawString(12 * mm, h - 14 * mm, "LUCAS ROBOTIC SYSTEM")
 
     c.setFont("Helvetica", 10)
-    right = "TECHNICAL DATA SHEET"
+    right = "FICHE TECHNIQUE"
     if title:
         right = f"{right}  –  {title}"
     c.drawRightString(w - 12 * mm, h - 14 * mm, right)
@@ -226,11 +226,11 @@ def _wrap_simple(text: str, max_chars: int) -> List[str]:
 
 
 def _draw_table_header_pdf(c: canvas.Canvas, col_label: float, col_value: float, col_source: float, y: float) -> float:
-    # Reset to black (important across pages)
+    # Important : reset noir à chaque page
     c.setFillColorRGB(0.0, 0.0, 0.0)
     c.setFont("Helvetica-Bold", 9)
     c.drawString(col_label, y, "Variable")
-    c.drawString(col_value, y, "Value")
+    c.drawString(col_value, y, "Valeur")
     c.drawString(col_source, y, "Source")
     y -= 4 * mm
 
@@ -290,10 +290,9 @@ def build_output_pdf(selected_rows: List[PDFRow]) -> bytes:
 
 
 # =========================================================
-# OUTPUT WORD (DOCX) - Lucas banner + fully editable
+# OUTPUT WORD (DOCX) - bandeau Lucas + éditable
 # =========================================================
 def _set_cell_shading(cell, fill_hex: str) -> None:
-    """Set background color for a docx table cell."""
     tcPr = cell._tc.get_or_add_tcPr()
     shd = OxmlElement("w:shd")
     shd.set(qn("w:val"), "clear")
@@ -303,7 +302,6 @@ def _set_cell_shading(cell, fill_hex: str) -> None:
 
 
 def _set_cell_margins(cell, top=80, bottom=80, start=120, end=120) -> None:
-    """Cell margins (in twips)."""
     tcPr = cell._tc.get_or_add_tcPr()
     tcMar = OxmlElement("w:tcMar")
     for k, v in (("top", top), ("bottom", bottom), ("start", start), ("end", end)):
@@ -314,31 +312,20 @@ def _set_cell_margins(cell, top=80, bottom=80, start=120, end=120) -> None:
     tcPr.append(tcMar)
 
 
-def _add_lucas_banner_docx(doc: Document, right_title: str = "TECHNICAL DATA SHEET") -> None:
-    """
-    Create a Lucas-like banner in Word:
-    - row1: black band with left "LUCAS ROBOTIC SYSTEM" (white) and right title (white)
-    - row2: thin red stripe
-    """
-    # Outer table for layout
+def _add_lucas_banner_docx(doc: Document, right_title: str = "FICHE TECHNIQUE") -> None:
     t = doc.add_table(rows=2, cols=2)
     t.alignment = WD_TABLE_ALIGNMENT.CENTER
 
-    # Row heights feel (Word doesn't guarantee exact heights, but OK)
-    # Black band
     for cell in t.rows[0].cells:
         _set_cell_shading(cell, "000000")
         _set_cell_margins(cell, top=120, bottom=120, start=180, end=180)
 
-    # Red stripe
     for cell in t.rows[1].cells:
-        _set_cell_shading(cell, "D90000")  # Lucas-ish red
+        _set_cell_shading(cell, "D90000")
         _set_cell_margins(cell, top=20, bottom=20, start=0, end=0)
 
-    # Merge cells on row2 to create a full-width stripe
     t.rows[1].cells[0].merge(t.rows[1].cells[1])
 
-    # Left text
     p_left = t.rows[0].cells[0].paragraphs[0]
     p_left.alignment = WD_ALIGN_PARAGRAPH.LEFT
     run = p_left.add_run("LUCAS ROBOTIC SYSTEM")
@@ -346,7 +333,6 @@ def _add_lucas_banner_docx(doc: Document, right_title: str = "TECHNICAL DATA SHE
     run.font.color.rgb = RGBColor(255, 255, 255)
     run.font.size = Pt(13)
 
-    # Right text
     p_right = t.rows[0].cells[1].paragraphs[0]
     p_right.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     run2 = p_right.add_run(right_title)
@@ -354,21 +340,18 @@ def _add_lucas_banner_docx(doc: Document, right_title: str = "TECHNICAL DATA SHE
     run2.font.color.rgb = RGBColor(255, 255, 255)
     run2.font.size = Pt(11)
 
-    doc.add_paragraph("")  # small spacer
+    doc.add_paragraph("")
 
 
 def build_output_docx(selected_rows: List[PDFRow]) -> bytes:
     doc = Document()
+    _add_lucas_banner_docx(doc, right_title="FICHE TECHNIQUE")
 
-    # Lucas banner (editable)
-    _add_lucas_banner_docx(doc, right_title="TECHNICAL DATA SHEET")
-
-    # Main table
     table = doc.add_table(rows=1, cols=3)
     table.style = "Table Grid"
     hdr = table.rows[0].cells
     hdr[0].text = "Variable"
-    hdr[1].text = "Value"
+    hdr[1].text = "Valeur"
     hdr[2].text = "Source"
 
     for r in selected_rows:
@@ -386,60 +369,59 @@ def build_output_docx(selected_rows: List[PDFRow]) -> bytes:
 # STREAMLIT UI
 # =========================================================
 def render_pdf_lab_panel():
-    st.subheader("PDF Lab – Clean / Assemble (generic)")
+    st.subheader("PDF Lab – Nettoyage / Assemblage")
 
-    # --- guidance / comments ---
-    with st.expander("How to use (quick guide)", expanded=True):
+    with st.expander("Mode d’emploi (aperçu rapide)", expanded=True):
         st.markdown(
             """
-**Goal:** build a clean, consistent Technical Sheet without illustrations / BOM / motor sizing blocks.
+**Objectif :** générer une fiche technique claire et cohérente à partir d’un ou deux PDF,
+en supprimant les illustrations, la nomenclature (BOM) et les blocs non pertinents.
 
-**Workflow**
-1) Choose the mode: **Clean (1 PDF)** or **Assemble (2 PDFs)**  
-2) Upload your PDF(s)  
-3) Optionally rename the sources (*Ensemble 1 / Ensemble 2*)  
-4) Use search + checkboxes to keep only what matters  
-5) Optionally edit values directly (e.g. correct a stroke, speed, payload)  
-6) Export **PDF** and/or **Word (DOCX)**
+**Déroulé**
+1) Choisir le mode : **Nettoyage (1 PDF)** ou **Assemblage (2 PDF)**  
+2) Charger le ou les PDF  
+3) Renommer les ensembles si nécessaire (ex : *Ensemble A / Ensemble B*)  
+4) Sélectionner les caractéristiques à conserver  
+5) Modifier si besoin certaines valeurs (course, vitesse, charge, etc.)  
+6) Exporter la fiche finale en **PDF** et/ou **Word (DOCX)**
 
-**Tips**
-- The “Fusion preset” is applied **only in Assemble mode** and is driven by `presets/fusion_default.csv`.
-- “Show only checked” is useful to review quickly before exporting.
+L’outil est conçu pour accélérer la préparation des offres et sécuriser le contenu
+des fiches techniques utilisées par l’avant-projet et le commerce.
             """
         )
 
     mode = st.radio(
         "Mode",
-        ["Clean (1 PDF)", "Assemble (2 PDFs)"],
+        ["Nettoyage (1 PDF)", "Assemblage (2 PDF)"],
         horizontal=True,
         key="pdf_mode",
-        help="Clean = remove unwanted blocks from a single PDF. Assemble = select variables from 2 PDFs and export one unified sheet.",
+        help="Nettoyage = sélectionner des caractéristiques depuis un seul PDF. Assemblage = sélectionner des caractéristiques depuis deux PDF et produire une fiche unique.",
     )
 
-    st.caption("Rename the sources for clarity (generic names recommended).")
+    st.caption("Renommez les ensembles pour rester générique (orientation inconnue à ce stade).")
     coln1, coln2 = st.columns(2)
     with coln1:
-        src1_name = st.text_input("Document 1 name", value="Ensemble 1", key="src1_name")
+        src1_name = st.text_input("Nom ensemble 1", value="Ensemble 1", key="src1_name")
     with coln2:
-        src2_name = st.text_input("Document 2 name", value="Ensemble 2", key="src2_name")
+        src2_name = st.text_input("Nom ensemble 2", value="Ensemble 2", key="src2_name")
 
-    if mode == "Clean (1 PDF)":
-        st.info("Upload one PDF, select the variables to keep, then export.")
-        pdf1 = st.file_uploader("PDF – Document 1", type=["pdf"], key="pdf1")
+    if mode == "Nettoyage (1 PDF)":
+        st.info("Chargez un PDF, sélectionnez les caractéristiques à conserver, puis exportez.")
+        pdf1 = st.file_uploader("PDF – Ensemble 1", type=["pdf"], key="pdf1")
         pdf2 = None
     else:
-        st.info("Upload two PDFs, select what you want from each, then export one unified sheet.")
+        st.info("Chargez deux PDF, sélectionnez ce que vous souhaitez conserver dans chacun, puis exportez une fiche unique.")
         c1, c2 = st.columns(2)
         with c1:
-            pdf1 = st.file_uploader("PDF – Document 1", type=["pdf"], key="pdf1")
+            pdf1 = st.file_uploader("PDF – Ensemble 1", type=["pdf"], key="pdf1")
         with c2:
-            pdf2 = st.file_uploader("PDF – Document 2", type=["pdf"], key="pdf2")
+            pdf2 = st.file_uploader("PDF – Ensemble 2", type=["pdf"], key="pdf2")
 
     if not pdf1:
-        st.warning("Upload at least 1 PDF to continue.")
+        st.warning("Veuillez charger au moins un PDF pour continuer.")
         return
-    if mode == "Assemble (2 PDFs)" and not pdf2:
-        st.warning("Upload the second PDF to assemble.")
+    if mode == "Assemblage (2 PDF)" and not pdf2:
+        st.warning("Veuillez charger le second PDF pour l’assemblage.")
         return
 
     b1 = pdf1.read()
@@ -456,10 +438,10 @@ def render_pdf_lab_panel():
     df2_key = f"pdf_lab::df::{doc2_id}"
 
     preset_labels = set()
-    if mode == "Assemble (2 PDFs)":
+    if mode == "Assemblage (2 PDF)":
         preset_labels = load_fusion_preset_labels_from_repo("presets/fusion_default.csv")
 
-    # INIT DOC1 (apply preset here)
+    # INIT DOC1 (apply preset here in Assemblage)
     if rows1_key not in st.session_state:
         rows1 = extract_pdf_rows(b1, doc_id=doc1_id, source_display=src1_name)
         st.session_state[rows1_key] = rows1
@@ -472,12 +454,12 @@ def render_pdf_lab_panel():
             "_key": r.key,
         } for r in rows1])
 
-        if mode == "Assemble (2 PDFs)" and preset_labels:
+        if mode == "Assemblage (2 PDF)" and preset_labels:
             df1_init = apply_fusion_presets_from_repo(df1_init, preset_labels)
 
         st.session_state[df1_key] = df1_init
 
-    # INIT DOC2 (apply preset here)
+    # INIT DOC2 (apply preset here in Assemblage)
     if b2 and rows2_key not in st.session_state:
         rows2 = extract_pdf_rows(b2, doc_id=doc2_id, source_display=src2_name)
         st.session_state[rows2_key] = rows2
@@ -490,7 +472,7 @@ def render_pdf_lab_panel():
             "_key": r.key,
         } for r in rows2])
 
-        if mode == "Assemble (2 PDFs)" and preset_labels:
+        if mode == "Assemblage (2 PDF)" and preset_labels:
             df2_init = apply_fusion_presets_from_repo(df2_init, preset_labels)
 
         st.session_state[df2_key] = df2_init
@@ -504,7 +486,7 @@ def render_pdf_lab_panel():
         df2 = pd.DataFrame(columns=df1.columns)
         rows2 = []
 
-    # Cosmetic rename only
+    # Rename sources (cosmetic)
     df1["Source"] = src1_name
     for r in rows1:
         r.source = src1_name
@@ -517,16 +499,16 @@ def render_pdf_lab_panel():
     n_checked_2 = int(df2["Keep"].sum()) if (b2 and "Keep" in df2.columns) else 0
 
     st.success(
-        f"Rows detected — {src1_name}: {len(df1)} (checked: {n_checked_1})"
-        + (f" | {src2_name}: {len(df2)} (checked: {n_checked_2})" if b2 else "")
+        f"Caractéristiques détectées — {src1_name} : {len(df1)} (sélectionnées : {n_checked_1})"
+        + (f" | {src2_name} : {len(df2)} (sélectionnées : {n_checked_2})" if b2 else "")
     )
 
-    st.caption("Use the search box to quickly find a variable (label or value).")
-    search = st.text_input("Search (Label/Value):", value="", key="pdf_search")
+    st.caption("Utilisez le champ de recherche pour retrouver rapidement une caractéristique (intitulé ou valeur).")
+    search = st.text_input("Recherche (intitulé / valeur)", value="", key="pdf_search")
 
-    tab_titles = [f"Document 1 – {src1_name}"]
+    tab_titles = [f"Ensemble 1 – {src1_name}"]
     if b2:
-        tab_titles.append(f"Document 2 – {src2_name}")
+        tab_titles.append(f"Ensemble 2 – {src2_name}")
     tabs = st.tabs(tab_titles)
 
     def _apply_editor_changes(df: pd.DataFrame, edited: pd.DataFrame) -> pd.DataFrame:
@@ -545,9 +527,8 @@ def render_pdf_lab_panel():
         return df
 
     def editor(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
-        st.caption("Tip: use 'Show only checked' to review quickly before exporting.")
         show_only_checked = st.toggle(
-            "Show only checked (this document)",
+            "Afficher uniquement les lignes sélectionnées",
             value=False,
             key=f"{key_prefix}_show_checked",
         )
@@ -563,16 +544,22 @@ def render_pdf_lab_panel():
         if show_only_checked:
             df_view = df_view[df_view["Keep"] == True]
             if df_view.empty:
-                st.info("No checked rows in this document yet.")
+                st.info("Aucune ligne sélectionnée dans cet ensemble pour le moment.")
                 return df
 
         cA, cB, _ = st.columns([1, 1, 6])
         with cA:
-            do_check_all = st.button("Check all (filtered)", key=f"{key_prefix}_all_on",
-                                     help="Check all rows currently visible (after search/filter).")
+            do_check_all = st.button(
+                "Tout sélectionner (filtré)",
+                key=f"{key_prefix}_all_on",
+                help="Sélectionne toutes les lignes visibles (après recherche/filtre).",
+            )
         with cB:
-            do_uncheck_all = st.button("Uncheck all (filtered)", key=f"{key_prefix}_all_off",
-                                       help="Uncheck all rows currently visible (after search/filter).")
+            do_uncheck_all = st.button(
+                "Tout désélectionner (filtré)",
+                key=f"{key_prefix}_all_off",
+                help="Désélectionne toutes les lignes visibles (après recherche/filtre).",
+            )
 
         if do_check_all:
             df.loc[df_view.index, "Keep"] = True
@@ -590,21 +577,21 @@ def render_pdf_lab_panel():
         if show_only_checked:
             df_view = df_view[df_view["Keep"] == True]
             if df_view.empty:
-                st.info("No checked rows in this document yet.")
+                st.info("Aucune ligne sélectionnée dans cet ensemble pour le moment.")
                 return df
 
         editor_key = f"{key_prefix}_editor__{'checked' if show_only_checked else 'all'}"
 
-        st.caption("You can edit the Value column (example: adjust a stroke or speed).")
+        st.caption("La colonne Valeur est éditable (exemple : ajuster une course, une vitesse ou une charge).")
         edited = st.data_editor(
             df_view[["Keep", "Label", "Value", "Source", "_key"]],
             use_container_width=True,
             hide_index=True,
             height=900,
             column_config={
-                "Keep": st.column_config.CheckboxColumn("Keep", default=False, width="small"),
-                "Label": st.column_config.TextColumn("Label", width="large"),
-                "Value": st.column_config.TextColumn("Value (editable)", width="large"),
+                "Keep": st.column_config.CheckboxColumn("Garder", default=False, width="small"),
+                "Label": st.column_config.TextColumn("Variable", width="large"),
+                "Value": st.column_config.TextColumn("Valeur (modifiable)", width="large"),
                 "Source": st.column_config.TextColumn("Source", width="medium"),
                 "_key": st.column_config.TextColumn("_key", width="small"),
             },
@@ -615,17 +602,17 @@ def render_pdf_lab_panel():
         return df
 
     with tabs[0]:
-        df1 = editor(df1, "doc1")
+        df1 = editor(df1, "ens1")
         st.session_state[df1_key] = df1
 
     if b2:
         with tabs[1]:
-            df2 = editor(df2, "doc2")
+            df2 = editor(df2, "ens2")
             st.session_state[df2_key] = df2
 
     st.markdown("---")
-    st.caption("Export the unified selection as PDF and/or Word (DOCX). Word is fully editable.")
-    if st.button("Generate documents", type="primary", key="btn_generate_docs"):
+    st.caption("Exporter la sélection finale en PDF et/ou Word (DOCX). Le document Word est entièrement modifiable.")
+    if st.button("Générer les documents", type="primary", key="btn_generate_docs"):
         selected: List[PDFRow] = []
 
         def collect(df: pd.DataFrame, rows: List[PDFRow]):
@@ -642,7 +629,7 @@ def render_pdf_lab_panel():
         collect(df2, rows2)
 
         if not selected:
-            st.warning("No rows selected: please check at least one variable.")
+            st.warning("Aucune ligne sélectionnée : veuillez cocher au moins une caractéristique.")
             return
 
         out_pdf = build_output_pdf(selected)
@@ -651,15 +638,15 @@ def render_pdf_lab_panel():
         cdl1, cdl2 = st.columns(2)
         with cdl1:
             st.download_button(
-                "💾 Download PDF",
+                "💾 Télécharger le PDF",
                 data=out_pdf,
-                file_name="TECHNICAL_SHEET.pdf",
+                file_name="FICHE_TECHNIQUE.pdf",
                 mime="application/pdf",
             )
         with cdl2:
             st.download_button(
-                "📝 Download Word (DOCX)",
+                "📝 Télécharger le Word (DOCX)",
                 data=out_docx,
-                file_name="TECHNICAL_SHEET.docx",
+                file_name="FICHE_TECHNIQUE.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
