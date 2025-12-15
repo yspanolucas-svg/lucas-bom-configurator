@@ -35,6 +35,102 @@ Straightness of the beam without deformation of the structure
 Stiffness
 label
 Robot brand
+label
+Robot brand
+Marque du robot
+Robot model
+Modèle du robot
+Robot payload
+Charge utile du robot
+Robot weight
+Masse du robot
+
+Maximum speed on the y-axis
+Vitesse maximale sur l’axe Y
+Maximum acceleration on the y-axis
+Accélération maximale sur l’axe Y
+Maximum speed on the z-axis
+Vitesse maximale sur l’axe Z
+Maximum acceleration on the z-axis
+Accélération maximale sur l’axe Z
+
+Useful stroke on the y-axis
+Course utile sur l’axe Y
+Useful stroke on the z-axis
+Course utile sur l’axe Z
+
+Effective stroke on the y-axis
+Course réelle sur l’axe Y
+Effective stroke on the z-axis
+Course réelle sur l’axe Z
+
+Acceleration max of carriage
+Accélération maximale du chariot
+Max travel speed
+Vitesse maximale de déplacement
+
+Energy chain width
+Largeur de la chaîne porte-câbles
+Energy chain position
+Position de la chaîne porte-câbles
+Arrival position of the cables
+Position de l’arrivée des câbles
+
+Precision and repeatability
+Précision et répétabilité
+Precision of racks
+Précision des crémaillères
+
+Application field
+Domaine d’application
+Type of application
+Type d’application
+Main environment
+Environnement principal
+
+Carriage housings color
+Couleur des carters du chariot
+Beam and pillars color
+Couleur de la poutre et des poteaux
+
+Warranty option
+Option de garantie
+Customer tests at LUCAS
+Essais client chez LUCAS
+Place of delivery and installation
+Lieu de livraison et d’installation
+Distance between LUCAS and the installation site
+Distance entre LUCAS et le site d’installation
+
+Noise level of device Below to
+Niveau sonore de l’équipement inférieur à
+
+Operating environment Closed site with a humidity level between
+Environnement de fonctionnement site fermé avec un taux d’humidité compris entre
+
+Standard color (optional color available) - Beam and pillars: RAL
+Couleur standard (autre couleur possible en option) - Poutre et poteaux : RAL
+- Casings: RAL
+- Carter : RAL
+- Carriage: RAL
+- Chariot : RAL
+
+Energy
+Énergie
+Cable chain Open cable
+Chaîne porte-câbles ouverte
+
+Useful stroke
+Course utile
+Load
+Charge
+Available ceiling
+Hauteur sous plafond disponible
+Size of the lifting arm
+Taille du bras de levage
+Information of robot configuration
+Information de configuration du robot
+
 Robot model
 Robot payload
 Robot weight
