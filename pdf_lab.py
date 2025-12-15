@@ -39,24 +39,40 @@ def _norm_label(s: str) -> str:
 
 
 # =========================================================
-# PRESET (from repo)
+# PRESET (from repo) - supports your "1 line = 1 label" format
 # =========================================================
 def load_fusion_preset_labels_from_repo(preset_path: str = "presets/fusion_default.csv") -> set[str]:
     """
-    Load preset labels from repo (no user upload).
-    Expected CSV format:
-      label
-      Maximum speed on the y-axis
-      ...
+    Supporte 2 formats :
+    1) CSV 'propre' (avec plusieurs colonnes) contenant une colonne 'label'
+    2) Fichier simple : 1 ligne = 1 label (format actuel)
+       Exemple:
+         label
+         Maximum speed on the y-axis
+         ...
     """
     if not os.path.exists(preset_path):
         return set()
 
-    df = pd.read_csv(preset_path)
-    if "label" not in df.columns:
-        return set()
+    # 1) tentative CSV classique
+    try:
+        df = pd.read_csv(preset_path)
+        # si c'est un vrai CSV avec plusieurs colonnes (donc séparateurs présents)
+        if "label" in df.columns and len(df.columns) > 1:
+            return set(df["label"].dropna().apply(_norm_label))
+    except Exception:
+        pass
 
-    return set(df["label"].dropna().apply(_norm_label))
+    # 2) fallback robuste : 1 ligne = 1 label
+    labels = set()
+    with open(preset_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.lower() == "label":
+                continue
+            labels.add(_norm_label(line))
+
+    return labels
 
 
 def apply_fusion_presets_from_repo(df: pd.DataFrame, preset_labels: set[str]) -> pd.DataFrame:
@@ -301,7 +317,6 @@ def render_pdf_lab_panel():
     b1 = pdf1.read()
     b2 = pdf2.read() if pdf2 else None
 
-    # stable doc ids based ONLY on pdf hashes
     h1 = _hash_bytes(b1)
     h2 = _hash_bytes(b2)
     doc1_id = f"doc1::{h1}"
@@ -312,7 +327,6 @@ def render_pdf_lab_panel():
     rows2_key = f"pdf_lab::rows::{doc2_id}"
     df2_key = f"pdf_lab::df::{doc2_id}"
 
-    # Load preset once per run (cheap) — used only during init
     preset_labels = set()
     if mode == "Assemble (2 PDFs)":
         preset_labels = load_fusion_preset_labels_from_repo("presets/fusion_default.csv")
@@ -370,7 +384,6 @@ def render_pdf_lab_panel():
     df1["Source"] = src1_name
     for r in rows1:
         r.source = src1_name
-
     if b2:
         df2["Source"] = src2_name
         for r in rows2:
