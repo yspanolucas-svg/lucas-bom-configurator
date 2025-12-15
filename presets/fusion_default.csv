@@ -8,3 +8,28 @@ Useful stroke on the z-axis
 Robot payload
 Robot model
 Robot weight
+label
+Robot brand
+Robot model
+Robot payload
+Robot weight
+Robot arm length
+Length of the robot base
+Width of the robot base
+Type of cycle
+Protection bellow option
+Down position of the lifting arm
+Useful stroke on the z-axis
+Effective stroke on the z-axis
+Maximum speed on the z-axis
+Maximum acceleration on the z-axis
+Useful stroke on the y-axis
+Effective stroke on the y-axis
+Maximum speed on the y-axis
+Maximum acceleration on the y-axis
+Precision of racks on y-axis
+Precision of racks on z-axis
+Unidirectional repeatability without deformation of the structure
+Bidirectional repeatability without deformation of the structure
+Straightness of the beam without deformation of the structure
+Stiffness
