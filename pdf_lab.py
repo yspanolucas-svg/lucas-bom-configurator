@@ -312,11 +312,19 @@ def render_pdf_lab_panel():
     rows2_key = f"pdf_lab::rows::{doc2_id}"
     df2_key = f"pdf_lab::df::{doc2_id}"
 
-    # init doc1 once per PDF
+    # Load preset once per run (cheap) — used only during init
+    preset_labels = set()
+    if mode == "Assemble (2 PDFs)":
+        preset_labels = load_fusion_preset_labels_from_repo("presets/fusion_default.csv")
+
+    # ----------------------------
+    # INIT DOC1 (apply preset HERE)
+    # ----------------------------
     if rows1_key not in st.session_state:
         rows1 = extract_pdf_rows(b1, doc_id=doc1_id, source_display=src1_name)
         st.session_state[rows1_key] = rows1
-        st.session_state[df1_key] = pd.DataFrame([{
+
+        df1_init = pd.DataFrame([{
             "Keep": False,
             "Label": r.label,
             "Value": r.value,
@@ -324,17 +332,30 @@ def render_pdf_lab_panel():
             "_key": r.key,
         } for r in rows1])
 
-    # init doc2 once per PDF
+        if mode == "Assemble (2 PDFs)" and preset_labels:
+            df1_init = apply_fusion_presets_from_repo(df1_init, preset_labels)
+
+        st.session_state[df1_key] = df1_init
+
+    # ----------------------------
+    # INIT DOC2 (apply preset HERE)
+    # ----------------------------
     if b2 and rows2_key not in st.session_state:
         rows2 = extract_pdf_rows(b2, doc_id=doc2_id, source_display=src2_name)
         st.session_state[rows2_key] = rows2
-        st.session_state[df2_key] = pd.DataFrame([{
+
+        df2_init = pd.DataFrame([{
             "Keep": False,
             "Label": r.label,
             "Value": r.value,
             "Source": r.source,
             "_key": r.key,
         } for r in rows2])
+
+        if mode == "Assemble (2 PDFs)" and preset_labels:
+            df2_init = apply_fusion_presets_from_repo(df2_init, preset_labels)
+
+        st.session_state[df2_key] = df2_init
 
     df1 = st.session_state[df1_key]
     rows1 = st.session_state[rows1_key]
@@ -354,19 +375,6 @@ def render_pdf_lab_panel():
         df2["Source"] = src2_name
         for r in rows2:
             r.source = src2_name
-
-    # ---------------------------------------------------------
-    # AUTO PRESET (Fusion only, apply once per pair of PDFs)
-    # ---------------------------------------------------------
-    if mode == "Assemble (2 PDFs)":
-        preset_labels = load_fusion_preset_labels_from_repo("presets/fusion_default.csv")
-        preset_applied_key = f"pdf_lab::fusion_preset_applied::{h1}::{h2}"
-        if preset_labels and preset_applied_key not in st.session_state:
-            df1 = apply_fusion_presets_from_repo(df1, preset_labels)
-            df2 = apply_fusion_presets_from_repo(df2, preset_labels)
-            st.session_state[df1_key] = df1
-            st.session_state[df2_key] = df2
-            st.session_state[preset_applied_key] = True
 
     st.info(f"Detected rows – {src1_name}: {len(df1)} | {src2_name}: {len(df2) if b2 else 0}")
 
