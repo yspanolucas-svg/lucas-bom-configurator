@@ -8,9 +8,12 @@ from typing import List, Optional, Dict
 import pandas as pd
 import streamlit as st
 from PyPDF2 import PdfReader
+
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
+
+from docx import Document  # python-docx
 
 
 # =========================================================
@@ -44,7 +47,7 @@ def _norm_label(s: str) -> str:
 def load_fusion_preset_labels_from_repo(preset_path: str = "presets/fusion_default.csv") -> set[str]:
     """
     Supporte 2 formats :
-    1) CSV 'propre' (avec plusieurs colonnes) contenant une colonne 'label'
+    1) CSV 'propre' (avec séparateurs) contenant une colonne 'label'
     2) Fichier simple : 1 ligne = 1 label (format actuel)
        Exemple:
          label
@@ -57,7 +60,7 @@ def load_fusion_preset_labels_from_repo(preset_path: str = "presets/fusion_defau
     # 1) tentative CSV classique
     try:
         df = pd.read_csv(preset_path)
-        # si c'est un vrai CSV avec plusieurs colonnes (donc séparateurs présents)
+        # Si c'est un vrai CSV avec plusieurs colonnes (donc séparateurs présents)
         if "label" in df.columns and len(df.columns) > 1:
             return set(df["label"].dropna().apply(_norm_label))
     except Exception:
@@ -173,7 +176,7 @@ def extract_pdf_rows(pdf_bytes: Optional[bytes], doc_id: str, source_display: st
 
 
 # =========================================================
-# PDF GENERATION (REPORTLAB) - page 2+ visibility fix
+# OUTPUT PDF (REPORTLAB) - page 2+ visibility fix
 # =========================================================
 def _draw_header(c: canvas.Canvas, title: str = "") -> float:
     w, h = A4
@@ -215,7 +218,6 @@ def _wrap_simple(text: str, max_chars: int) -> List[str]:
 
 
 def _draw_table_header(c: canvas.Canvas, col_label: float, col_value: float, col_source: float, y: float) -> float:
-    # critical: reset black after header (header uses white)
     c.setFillColorRGB(0.0, 0.0, 0.0)
     c.setFont("Helvetica-Bold", 9)
     c.drawString(col_label, y, "Variable")
@@ -279,6 +281,37 @@ def build_output_pdf(selected_rows: List[PDFRow]) -> bytes:
 
 
 # =========================================================
+# OUTPUT WORD (DOCX) - NOT LOCKED / FULLY EDITABLE
+# =========================================================
+def build_output_docx(selected_rows: List[PDFRow]) -> bytes:
+    doc = Document()
+
+    doc.add_heading("LUCAS ROBOTIC SYSTEM", level=1)
+    p = doc.add_paragraph("TECHNICAL DATA SHEET")
+    p.runs[0].bold = True
+
+    doc.add_paragraph("")
+
+    table = doc.add_table(rows=1, cols=3)
+    table.style = "Table Grid"
+
+    hdr = table.rows[0].cells
+    hdr[0].text = "Variable"
+    hdr[1].text = "Value"
+    hdr[2].text = "Source"
+
+    for r in selected_rows:
+        row = table.add_row().cells
+        row[0].text = str(r.label)
+        row[1].text = str(r.value)
+        row[2].text = str(r.source)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+# =========================================================
 # STREAMLIT UI
 # =========================================================
 def render_pdf_lab_panel():
@@ -331,9 +364,7 @@ def render_pdf_lab_panel():
     if mode == "Assemble (2 PDFs)":
         preset_labels = load_fusion_preset_labels_from_repo("presets/fusion_default.csv")
 
-    # ----------------------------
-    # INIT DOC1 (apply preset HERE)
-    # ----------------------------
+    # INIT DOC1 (apply preset here)
     if rows1_key not in st.session_state:
         rows1 = extract_pdf_rows(b1, doc_id=doc1_id, source_display=src1_name)
         st.session_state[rows1_key] = rows1
@@ -351,9 +382,7 @@ def render_pdf_lab_panel():
 
         st.session_state[df1_key] = df1_init
 
-    # ----------------------------
-    # INIT DOC2 (apply preset HERE)
-    # ----------------------------
+    # INIT DOC2 (apply preset here)
     if b2 and rows2_key not in st.session_state:
         rows2 = extract_pdf_rows(b2, doc_id=doc2_id, source_display=src2_name)
         st.session_state[rows2_key] = rows2
@@ -380,7 +409,7 @@ def render_pdf_lab_panel():
         df2 = pd.DataFrame(columns=df1.columns)
         rows2 = []
 
-    # Cosmetic rename only (no reset)
+    # Cosmetic rename only
     df1["Source"] = src1_name
     for r in rows1:
         r.source = src1_name
@@ -488,7 +517,7 @@ def render_pdf_lab_panel():
             df2 = editor(df2, "doc2")
             st.session_state[df2_key] = df2
 
-    if st.button("Generate output PDF", type="primary", key="btn_generate_pdf"):
+    if st.button("Generate documents", type="primary", key="btn_generate_docs"):
         selected: List[PDFRow] = []
 
         def collect(df: pd.DataFrame, rows: List[PDFRow]):
@@ -508,11 +537,21 @@ def render_pdf_lab_panel():
             st.warning("No rows selected: please check at least one variable.")
             return
 
-        out = build_output_pdf(selected)
+        out_pdf = build_output_pdf(selected)
+        out_docx = build_output_docx(selected)
 
-        st.download_button(
-            "💾 Download PDF",
-            data=out,
-            file_name="TECHNICAL_SHEET.pdf",
-            mime="application/pdf",
-        )
+        cdl1, cdl2 = st.columns(2)
+        with cdl1:
+            st.download_button(
+                "💾 Download PDF",
+                data=out_pdf,
+                file_name="TECHNICAL_SHEET.pdf",
+                mime="application/pdf",
+            )
+        with cdl2:
+            st.download_button(
+                "📝 Download Word (DOCX)",
+                data=out_docx,
+                file_name="TECHNICAL_SHEET.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
