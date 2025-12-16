@@ -1,26 +1,17 @@
 import re
 import math
 import json
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
 from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 
 import streamlit as st
-
-
-# ============================================================
-# STEP Lab (Option B)
-# - Assemblage STEP par réécriture texte (sans CAO)
-# - Apprentissage 1 fois via un STEP assemblé correct
-# - Preset JSON (axes + origin) dans /presets
-# ============================================================
 
 PRESET_PATH = Path("presets/step_cantilever_default.json")
 
 
-# ----------------------------
-# Presets
-# ----------------------------
+# ============================================================
+# Preset JSON
+# ============================================================
 def load_step_preset() -> Optional[dict]:
     if PRESET_PATH.exists():
         with open(PRESET_PATH, "r", encoding="utf-8") as f:
@@ -40,31 +31,13 @@ def save_step_preset(axis1, axis2, axis3, origin) -> None:
         json.dump(data, f, indent=2)
 
 
-def default_preset_dict() -> dict:
-    return {
-        "axis1": [1.0, 0.0, 0.0],
-        "axis2": [0.0, 1.0, 0.0],
-        "axis3": [0.0, 0.0, 1.0],
-        "origin": [0.0, 0.0, 0.0],
-    }
-
-
-# ----------------------------
-# Parser STEP (texte)
-# ----------------------------
-@dataclass
-class StepParse:
-    header_lines: List[str]
-    data_lines_raw: List[str]
-    entities: Dict[int, str]     # id -> "ENTITY(...);"
-    end_lines: List[str]
-
-
+# ============================================================
+# STEP parsing (robuste multi-lignes)
+# ============================================================
 def _split_step_sections(text: str) -> Tuple[List[str], List[str], List[str]]:
-    lines = text.splitlines(True)  # keep \n
+    lines = text.splitlines(True)
     header, data, tail = [], [], []
     mode = "HEADER"
-
     for ln in lines:
         up = ln.upper()
         if "DATA;" in up:
@@ -82,21 +55,15 @@ def _split_step_sections(text: str) -> Tuple[List[str], List[str], List[str]]:
             data.append(ln)
         else:
             tail.append(ln)
-
     return header, data, tail
 
 
 def _collect_entities(data_lines: List[str]) -> Dict[int, str]:
-    """
-    Collecte des entités STEP en gérant les entités multi-lignes.
-    """
     entities: Dict[int, str] = {}
     buf = ""
-
     for ln in data_lines:
         if not ln.strip():
             continue
-
         buf += ln
         if ";" not in ln:
             continue
@@ -104,22 +71,20 @@ def _collect_entities(data_lines: List[str]) -> Dict[int, str]:
         parts = buf.split(";")
         for part in parts[:-1]:
             s = (part + ";").strip()
-            m = re.match(r"^\s*#(\d+)\s*=\s*(.+);\s*$", s, flags=re.IGNORECASE | re.DOTALL)
+            m = re.match(r"^\s*#(\d+)\s*=\s*(.+);\s*$", s, flags=re.I | re.S)
             if m:
                 eid = int(m.group(1))
                 body = m.group(2).strip()
                 entities[eid] = f"{body};"
-
         buf = parts[-1]
-
     return entities
 
 
-def parse_step(step_bytes: bytes) -> StepParse:
+def parse_step(step_bytes: bytes):
     txt = step_bytes.decode("utf-8", errors="ignore")
     header, data, tail = _split_step_sections(txt)
-    ent = _collect_entities(data)
-    return StepParse(header_lines=header, data_lines_raw=data, entities=ent, end_lines=tail)
+    ents = _collect_entities(data)
+    return header, ents, tail
 
 
 def max_entity_id(entities: Dict[int, str]) -> int:
@@ -127,9 +92,6 @@ def max_entity_id(entities: Dict[int, str]) -> int:
 
 
 def renumber_entities(entities: Dict[int, str], offset: int) -> Dict[int, str]:
-    """
-    Renumérote toutes les références #id dans le corps.
-    """
     if offset == 0:
         return dict(entities)
 
@@ -157,9 +119,6 @@ def find_first_id_containing(entities: Dict[int, str], keywords: List[str]) -> O
 
 
 def find_first_shape_representation_id(entities: Dict[int, str]) -> Optional[int]:
-    """
-    Heuristique : on prend en priorité ADVANCED_BREP_SHAPE_REPRESENTATION
-    """
     for kw in [
         "ADVANCED_BREP_SHAPE_REPRESENTATION",
         "MANIFOLD_SURFACE_SHAPE_REPRESENTATION",
@@ -171,20 +130,14 @@ def find_first_shape_representation_id(entities: Dict[int, str]) -> Optional[int
     return None
 
 
-def replace_shape_definition_representation_target(
-    entities: Dict[int, str],
-    new_shape_rep_id: int
-) -> bool:
-    """
-    Modifie la première SHAPE_DEFINITION_REPRESENTATION pour pointer vers new_shape_rep_id.
-    """
+def replace_shape_definition_representation_target(entities: Dict[int, str], new_shape_rep_id: int) -> bool:
     for eid in sorted(entities.keys()):
         body = entities[eid]
         if "SHAPE_DEFINITION_REPRESENTATION" in body.upper():
             m = re.match(
                 r"^\s*SHAPE_DEFINITION_REPRESENTATION\s*\(\s*(#\d+)\s*,\s*(#\d+)\s*\)\s*;\s*$",
                 body,
-                flags=re.IGNORECASE
+                flags=re.I
             )
             if m:
                 a = m.group(1)
@@ -193,21 +146,21 @@ def replace_shape_definition_representation_target(
     return False
 
 
-# ----------------------------
-# Maths / vecteurs
-# ----------------------------
-def _norm(v: Tuple[float, float, float]) -> float:
+# ============================================================
+# Vecteurs
+# ============================================================
+def _norm(v):
     return math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
 
 
-def _normalize(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+def _normalize(v):
     n = _norm(v)
     if n < 1e-12:
         return (0.0, 0.0, 0.0)
     return (v[0]/n, v[1]/n, v[2]/n)
 
 
-def _cross(a: Tuple[float,float,float], b: Tuple[float,float,float]) -> Tuple[float,float,float]:
+def _cross(a, b):
     return (
         a[1]*b[2] - a[2]*b[1],
         a[2]*b[0] - a[0]*b[2],
@@ -215,232 +168,140 @@ def _cross(a: Tuple[float,float,float], b: Tuple[float,float,float]) -> Tuple[fl
     )
 
 
-# ----------------------------
-# Extraction infos géométriques
-# ----------------------------
-def _parse_cartesian_point(body: str) -> Optional[Tuple[float, float, float]]:
-    m = re.search(r"CARTESIAN_POINT\s*\(\s*'[^']*'\s*,\s*\(\s*([^\)]+)\s*\)\s*\)", body, flags=re.I)
-    if not m:
-        return None
-    coords = m.group(1).replace(" ", "")
-    parts = coords.split(",")
-    if len(parts) != 3:
-        return None
-
-    def f(x: str) -> float:
-        return float(x.replace("E", "e"))
-
-    try:
-        return (f(parts[0]), f(parts[1]), f(parts[2]))
-    except Exception:
-        return None
+# ============================================================
+# Extraction : récupérer le nom du PRODUCT dans un STEP “simple”
+# ============================================================
+def extract_first_product_name(step_bytes: bytes) -> Optional[str]:
+    _, ents, _ = parse_step(step_bytes)
+    for eid in sorted(ents.keys()):
+        body = ents[eid].strip()
+        if body.upper().startswith("PRODUCT("):
+            # PRODUCT('NAME','DESC',...
+            m = re.match(r"PRODUCT\(\s*'([^']+)'", body, flags=re.I)
+            if m:
+                return m.group(1)
+    return None
 
 
-def _parse_direction(body: str) -> Optional[Tuple[float, float, float]]:
-    m = re.search(r"DIRECTION\s*\(\s*'[^']*'\s*,\s*\(\s*([^\)]+)\s*\)\s*\)", body, flags=re.I)
-    if not m:
-        return None
-    coords = m.group(1).replace(" ", "")
-    parts = coords.split(",")
-    if len(parts) != 3:
-        return None
+# ============================================================
+# Extraction placement depuis référence assemblée
+# (ciblée sur base_name + part_name)
+# ============================================================
+def extract_transform_from_reference_targeted(
+    ref_bytes: bytes,
+    base_name: str,
+    part_name: str
+) -> Tuple[Tuple[float,float,float], Tuple[float,float,float], Tuple[float,float,float], Tuple[float,float,float]]:
+    _, ents, _ = parse_step(ref_bytes)
 
-    def f(x: str) -> float:
-        return float(x.replace("E", "e"))
-
-    try:
-        return (f(parts[0]), f(parts[1]), f(parts[2]))
-    except Exception:
-        return None
-
-
-def _parse_axis2_placement_3d(body: str) -> Optional[Tuple[int, Optional[int], Optional[int]]]:
-    """
-    AXIS2_PLACEMENT_3D('',#loc,#axis,#ref)
-    axis/ref peuvent être $ selon export.
-    Retour: (loc_point_id, axis_dir_id|None, ref_dir_id|None)
-    """
-    m = re.match(
-        r"^\s*AXIS2_PLACEMENT_3D\s*\(\s*'[^']*'\s*,\s*(#\d+)\s*,\s*([^,]+)\s*,\s*([^\)]+)\s*\)\s*;\s*$",
-        body.strip(),
-        flags=re.I
-    )
-    if not m:
-        return None
-    loc = int(m.group(1)[1:])
-    axis_raw = m.group(2).strip()
-    ref_raw = m.group(3).strip()
-
-    axis = None if axis_raw == "$" else int(axis_raw[1:])
-    ref = None if ref_raw == "$" else int(ref_raw[1:])
-    return (loc, axis, ref)
-
-
-# ----------------------------
-# Extraction transformation depuis un STEP assemblé référence
-# (robuste : CTO3D / ITEM_DEFINED_TRANSFORMATION / fallback AXIS2)
-# ----------------------------
-def extract_transform_from_reference(ref_bytes: bytes) -> Tuple[
-    Tuple[float,float,float],
-    Tuple[float,float,float],
-    Tuple[float,float,float],
-    Tuple[float,float,float]
-]:
-    """
-    Retourne axis1(X), axis2(Y), axis3(Z), origin(Tx,Ty,Tz)
-    en essayant successivement:
-      A) CARTESIAN_TRANSFORMATION_OPERATOR_3D non-identité
-      B) ITEM_DEFINED_TRANSFORMATION + AXIS2_PLACEMENT_3D (très courant en AP242)
-      C) fallback : meilleur AXIS2_PLACEMENT_3D non-zero
-    """
-    ref = parse_step(ref_bytes)
-    ents = ref.entities
-
-    points: Dict[int, Tuple[float,float,float]] = {}
-    dirs: Dict[int, Tuple[float,float,float]] = {}
-    axis2: Dict[int, Tuple[int, Optional[int], Optional[int]]] = {}
+    # 1) Index CARTESIAN_POINT / DIRECTION / AXIS2_PLACEMENT_3D
+    points = {}
+    dirs = {}
+    axis2 = {}
 
     for eid, body in ents.items():
         up = body.upper().strip()
+
         if up.startswith("CARTESIAN_POINT"):
-            p = _parse_cartesian_point(body)
-            if p:
-                points[eid] = p
+            m = re.search(r"\(\s*'[^']*'\s*,\s*\(\s*([^\)]+)\s*\)\s*\)", body, flags=re.I)
+            if m:
+                parts = m.group(1).replace(" ", "").split(",")
+                if len(parts) == 3:
+                    try:
+                        points[eid] = tuple(float(p.replace("E", "e")) for p in parts)
+                    except:
+                        pass
+
         elif up.startswith("DIRECTION"):
-            d = _parse_direction(body)
-            if d:
-                dirs[eid] = _normalize(d)
+            m = re.search(r"\(\s*'[^']*'\s*,\s*\(\s*([^\)]+)\s*\)\s*\)", body, flags=re.I)
+            if m:
+                parts = m.group(1).replace(" ", "").split(",")
+                if len(parts) == 3:
+                    try:
+                        d = tuple(float(p.replace("E", "e")) for p in parts)
+                        dirs[eid] = _normalize(d)
+                    except:
+                        pass
+
         elif up.startswith("AXIS2_PLACEMENT_3D"):
-            a = _parse_axis2_placement_3d(body)
-            if a:
-                axis2[eid] = a
+            m = re.match(
+                r"AXIS2_PLACEMENT_3D\(\s*'[^']*'\s*,\s*(#\d+)\s*,\s*([^,]+)\s*,\s*([^\)]+)\s*\)\s*;",
+                body.strip(),
+                flags=re.I
+            )
+            if m:
+                loc = int(m.group(1)[1:])
+                axis_raw = m.group(2).strip()
+                ref_raw = m.group(3).strip()
+                axis_id = None if axis_raw == "$" else int(axis_raw[1:])
+                ref_id = None if ref_raw == "$" else int(ref_raw[1:])
+                axis2[eid] = (loc, axis_id, ref_id)
 
-    # ------------------------------------------------------------
-    # A) CARTESIAN_TRANSFORMATION_OPERATOR_3D
-    # ------------------------------------------------------------
-    re_cto = re.compile(
-        r"^CARTESIAN_TRANSFORMATION_OPERATOR_3D\s*\(\s*'[^']*'\s*,\s*(#\d+)\s*,\s*(#\d+)\s*,\s*(#\d+)\s*,\s*([^,]+)\s*,\s*(#\d+)\s*\)\s*;\s*$",
-        flags=re.I
-    )
-
-    best = None
-    best_score = -1.0
-
-    for eid in sorted(ents.keys()):
-        body = ents[eid].strip()
-        m = re_cto.match(body)
-        if not m:
-            continue
-
-        a1 = int(m.group(1)[1:])
-        a2 = int(m.group(2)[1:])
-        loc = int(m.group(3)[1:])
-        a3 = int(m.group(5)[1:])
-
-        if loc not in points or a1 not in dirs or a2 not in dirs or a3 not in dirs:
-            continue
-
-        origin = points[loc]
-        d_origin = _norm(origin)
-        if d_origin < 1e-6:
-            continue
-
-        axis1 = dirs[a1]
-        axis2v = dirs[a2]
-        axis3 = dirs[a3]
-
-        if d_origin > best_score:
-            best_score = d_origin
-            best = (axis1, axis2v, axis3, origin)
-
-    if best is not None:
-        return best
-
-    # ------------------------------------------------------------
-    # B) ITEM_DEFINED_TRANSFORMATION
-    # ITEM_DEFINED_TRANSFORMATION('', '', #ax2a, #ax2b);
-    # On prend la cible (ax2b) comme repère position/rotation.
-    # ------------------------------------------------------------
-    re_idt = re.compile(
-        r"^\s*ITEM_DEFINED_TRANSFORMATION\s*\(\s*'[^']*'\s*,\s*'[^']*'\s*,\s*(#\d+)\s*,\s*(#\d+)\s*\)\s*;\s*$",
-        flags=re.I
-    )
-
-    best = None
-    best_score = -1.0
+    # 2) Trouver le PRODUCT_DEFINITION_SHAPE “Placement of <part> with respect to <base>”
+    pds_id = None
+    needle1 = f"PLACEMENT OF {part_name}".upper()
+    needle2 = f"WITH RESPECT TO {base_name}".upper()
 
     for eid in sorted(ents.keys()):
+        body_up = ents[eid].upper()
+        if body_up.startswith("PRODUCT_DEFINITION_SHAPE") and (needle1 in body_up) and (needle2 in body_up):
+            pds_id = eid
+            break
+
+    if pds_id is None:
+        raise ValueError(
+            "Référence : impossible d’identifier le placement ciblé (PRODUCT_DEFINITION_SHAPE) "
+            f"pour part='{part_name}' / base='{base_name}'."
+        )
+
+    # 3) Trouver CONTEXT_DEPENDENT_SHAPE_REPRESENTATION(#rel,#pds)
+    rel_id = None
+    for eid in sorted(ents.keys()):
         body = ents[eid].strip()
-        m = re_idt.match(body)
-        if not m:
-            continue
-        ax2_a = int(m.group(1)[1:])
-        ax2_b = int(m.group(2)[1:])
+        if body.upper().startswith("CONTEXT_DEPENDENT_SHAPE_REPRESENTATION"):
+            m = re.match(r"CONTEXT_DEPENDENT_SHAPE_REPRESENTATION\(\s*(#\d+)\s*,\s*(#\d+)\s*\)\s*;", body, flags=re.I)
+            if m and int(m.group(2)[1:]) == pds_id:
+                rel_id = int(m.group(1)[1:])
+                break
 
-        if ax2_b not in axis2:
-            continue
+    if rel_id is None:
+        raise ValueError("Référence : CONTEXT_DEPENDENT_SHAPE_REPRESENTATION introuvable pour ce placement.")
 
-        loc_id, z_id, x_id = axis2[ax2_b]
-        if loc_id not in points:
-            continue
+    # 4) Dans rel_id, trouver REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#idt)
+    rel_body = ents.get(rel_id, "")
+    m = re.search(r"REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION\(\s*(#\d+)\s*\)", rel_body, flags=re.I)
+    if not m:
+        raise ValueError("Référence : pas de REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION dans la relation trouvée.")
+    idt_id = int(m.group(1)[1:])
 
-        origin = points[loc_id]
-        d_origin = _norm(origin)
-        if d_origin < 1e-6:
-            continue
+    # 5) ITEM_DEFINED_TRANSFORMATION('', '', #ax2a, #ax2b)
+    idt_body = ents.get(idt_id, "")
+    m = re.match(r"ITEM_DEFINED_TRANSFORMATION\(\s*'[^']*'\s*,\s*'[^']*'\s*,\s*(#\d+)\s*,\s*(#\d+)\s*\)\s*;",
+                 idt_body, flags=re.I)
+    if not m:
+        raise ValueError("Référence : ITEM_DEFINED_TRANSFORMATION illisible pour le placement ciblé.")
+    ax2_b = int(m.group(2)[1:])
 
-        # z axis
-        z = (0.0, 0.0, 1.0) if (z_id is None or z_id not in dirs) else dirs[z_id]
-        # x axis
-        x = (1.0, 0.0, 0.0) if (x_id is None or x_id not in dirs) else dirs[x_id]
+    if ax2_b not in axis2:
+        raise ValueError("Référence : AXIS2_PLACEMENT_3D (cible) introuvable.")
 
-        x = _normalize(x)
-        z = _normalize(z)
-        y = _normalize(_cross(z, x))  # Y = Z x X (convention repère direct)
-        # Re-orthonormaliser X = Y x Z (au cas où)
-        x = _normalize(_cross(y, z))
+    loc_id, z_id, x_id = axis2[ax2_b]
+    origin = points.get(loc_id, (0.0, 0.0, 0.0))
 
-        if d_origin > best_score:
-            best_score = d_origin
-            best = (x, y, z, origin)
+    z = (0.0, 0.0, 1.0) if (z_id is None or z_id not in dirs) else dirs[z_id]
+    x = (1.0, 0.0, 0.0) if (x_id is None or x_id not in dirs) else dirs[x_id]
 
-    if best is not None:
-        return best
+    x = _normalize(x)
+    z = _normalize(z)
+    y = _normalize(_cross(z, x))
+    x = _normalize(_cross(y, z))
 
-    # ------------------------------------------------------------
-    # C) Fallback : meilleur AXIS2_PLACEMENT_3D non-zero
-    # ------------------------------------------------------------
-    best = None
-    best_score = -1.0
-    for ax2_id, (loc_id, z_id, x_id) in axis2.items():
-        if loc_id not in points:
-            continue
-        origin = points[loc_id]
-        d_origin = _norm(origin)
-        if d_origin < 1e-6:
-            continue
-
-        z = (0.0, 0.0, 1.0) if (z_id is None or z_id not in dirs) else dirs[z_id]
-        x = (1.0, 0.0, 0.0) if (x_id is None or x_id not in dirs) else dirs[x_id]
-
-        x = _normalize(x)
-        z = _normalize(z)
-        y = _normalize(_cross(z, x))
-        x = _normalize(_cross(y, z))
-
-        if d_origin > best_score:
-            best_score = d_origin
-            best = (x, y, z, origin)
-
-    if best is not None:
-        return best
-
-    raise ValueError("Impossible d’extraire une transformation exploitable dans la référence (CTO3D / IDT / AXIS2).")
+    return x, y, z, origin
 
 
-# ----------------------------
-# Construction STEP assemblé (Option B)
-# ----------------------------
+# ============================================================
+# Assemblage Option B (réécriture STEP)
+# ============================================================
 def build_step_assembly_option_b(
     base_bytes: bytes,
     part_bytes: bytes,
@@ -449,27 +310,21 @@ def build_step_assembly_option_b(
     axis3: Tuple[float,float,float],
     origin: Tuple[float,float,float],
 ) -> bytes:
-    """
-    Construit un STEP assemblé :
-    - Base = ensemble maître (identité)
-    - Part = ensemble ajouté placé via (axis1/axis2/axis3/origin)
-    """
-    base = parse_step(base_bytes)
-    part = parse_step(part_bytes)
+    base_header, base_ents, _ = parse_step(base_bytes)
+    part_header, part_ents, _ = parse_step(part_bytes)
 
-    # Renumérotation PART
-    base_max = max_entity_id(base.entities)
+    base_max = max_entity_id(base_ents)
     offset = base_max + 1000
-    part_renum = renumber_entities(part.entities, offset)
+    part_renum = renumber_entities(part_ents, offset)
 
-    merged = dict(base.entities)
+    merged = dict(base_ents)
     merged.update(part_renum)
 
     ctx_id = find_first_id_containing(merged, ["GEOMETRIC_REPRESENTATION_CONTEXT"])
     if ctx_id is None:
         raise ValueError("GEOMETRIC_REPRESENTATION_CONTEXT introuvable dans le STEP base.")
 
-    base_shape_id = find_first_shape_representation_id(base.entities)
+    base_shape_id = find_first_shape_representation_id(base_ents)
     if base_shape_id is None:
         raise ValueError("SHAPE_REPRESENTATION introuvable dans le STEP base.")
 
@@ -516,18 +371,15 @@ def build_step_assembly_option_b(
     p_xf  = add(f"CARTESIAN_TRANSFORMATION_OPERATOR_3D('',#{p_a1},#{p_a2},#{p_org},1.,#{p_a3})")
     p_mapped = add(f"MAPPED_ITEM(#{p_map},#{p_xf})")
 
-    # Nouvelle shape rep globale
     new_shape_rep = add(f"SHAPE_REPRESENTATION('',(#{b_mapped},#{p_mapped}),#{ctx_id})")
-
-    modified = replace_shape_definition_representation_target(merged, new_shape_rep)
-    if not modified:
+    ok = replace_shape_definition_representation_target(merged, new_shape_rep)
+    if not ok:
         pd_id = find_first_id_containing(merged, ["PRODUCT_DEFINITION"])
         if pd_id is not None:
             add(f"SHAPE_DEFINITION_REPRESENTATION(#{pd_id},#{new_shape_rep})")
 
     out = []
-    out.extend(base.header_lines)
-
+    out.extend(base_header)
     if not any("DATA;" in ln.upper() for ln in out):
         out.append("DATA;\n")
 
@@ -541,40 +393,27 @@ def build_step_assembly_option_b(
 
 
 # ============================================================
-# STREAMLIT PANEL
+# STREAMLIT UI
 # ============================================================
 def render_step_lab_panel():
     st.subheader("🧊 STEP Lab – Assemblage cantilever (sans CAO)")
 
     st.markdown(
         """
-**But :** assembler deux STEP (Ensemble A + Ensemble B) en appliquant une règle de placement déterministe.
+**But :** assembler deux STEP (Ensemble A + Ensemble B) via un preset.
 
-**Principe :**
-- 1) Vous chargez une référence assemblée correcte **une seule fois** → on apprend la transformation.
-- 2) On sauvegarde la règle dans `presets/step_cantilever_default.json`.
-- 3) Ensuite : vous assemblez ES + RC2 sans recharger la référence.
+**Apprentissage :**
+- On fournit Ensemble A + Ensemble B + un STEP assemblé de référence.
+- On extrait **la transformation ciblée** (placement du PRODUCT B dans l’assemblage).
+- On sauvegarde `presets/step_cantilever_default.json`.
         """
     )
 
     preset = load_step_preset()
-
-    colp1, colp2 = st.columns([2, 1])
-    with colp1:
-        if preset:
-            st.success("Preset STEP trouvé ✅ (il sera utilisé pour l’assemblage)")
-        else:
-            st.warning("Aucun preset STEP trouvé. Apprenez-le avec une référence assemblée.")
-    with colp2:
-        if st.button("🧹 Réinitialiser le preset", help="Remet le preset à l’identité (0,0,0)"):
-            save_step_preset(
-                axis1=(1.0,0.0,0.0),
-                axis2=(0.0,1.0,0.0),
-                axis3=(0.0,0.0,1.0),
-                origin=(0.0,0.0,0.0),
-            )
-            st.success("Preset réinitialisé.")
-            st.rerun()
+    if preset:
+        st.success("Preset STEP trouvé ✅")
+    else:
+        st.warning("Aucun preset STEP. Faites l’apprentissage avec une référence assemblée.")
 
     st.markdown("---")
 
@@ -587,81 +426,57 @@ def render_step_lab_panel():
     with c2:
         st.markdown("### 2) Apprentissage (1 fois)")
         ref_up = st.file_uploader("STEP référence assemblé (cantilever correct)", type=["stp", "step"], key="step_ref")
-        st.caption("Ce fichier n’est pas stocké. On ne garde que la règle (axes + origin).")
+        st.caption("Le fichier référence n’est pas stocké. On conserve uniquement la règle (axes + origin).")
 
     step_a_bytes = step_a_up.read() if step_a_up else None
     step_b_bytes = step_b_up.read() if step_b_up else None
     ref_bytes = ref_up.read() if ref_up else None
 
     st.markdown("### Apprendre / mettre à jour le preset")
-    if st.button("📚 Apprendre depuis la référence et enregistrer le preset", disabled=(ref_bytes is None)):
+    learn_disabled = (ref_bytes is None) or (step_a_bytes is None) or (step_b_bytes is None)
+
+    if st.button("📚 Apprendre depuis la référence et enregistrer le preset", disabled=learn_disabled):
         try:
-            a1, a2, a3, org = extract_transform_from_reference(ref_bytes)
+            base_name = extract_first_product_name(step_a_bytes) or ""
+            part_name = extract_first_product_name(step_b_bytes) or ""
+            if not base_name or not part_name:
+                raise ValueError("Impossible de lire le nom PRODUCT dans Ensemble A ou Ensemble B.")
+
+            a1, a2, a3, org = extract_transform_from_reference_targeted(ref_bytes, base_name, part_name)
             save_step_preset(a1, a2, a3, org)
+
             st.success("Preset cantilever enregistré ✅")
-            st.json({
-                "axis1": a1,
-                "axis2": a2,
-                "axis3": a3,
-                "origin": org
-            })
+            st.write(f"Base PRODUCT: `{base_name}`")
+            st.write(f"Part  PRODUCT: `{part_name}`")
+            st.json({"axis1": a1, "axis2": a2, "axis3": a3, "origin": org})
             st.info("Vous pouvez maintenant assembler sans recharger la référence.")
         except Exception as e:
             st.error(f"Erreur apprentissage : {e}")
 
     st.markdown("---")
 
-    preset = load_step_preset() or default_preset_dict()
+    preset = load_step_preset()
     with st.expander("Voir le preset actuel", expanded=False):
-        st.json(preset)
+        st.json(preset if preset else {})
 
     st.markdown("### Génération du STEP assemblé")
     if not step_a_bytes or not step_b_bytes:
         st.info("Chargez Ensemble A et Ensemble B pour activer l’assemblage.")
         return
 
-    with st.expander("Réglages avancés (optionnel)", expanded=False):
-        use_override = st.checkbox("Forcer une transformation manuelle (debug)", value=False)
-        if use_override:
-            tx = st.number_input("Tx", value=float(preset["origin"][0]), step=1.0, format="%.3f")
-            ty = st.number_input("Ty", value=float(preset["origin"][1]), step=1.0, format="%.3f")
-            tz = st.number_input("Tz", value=float(preset["origin"][2]), step=1.0, format="%.3f")
-
-            a1x = st.number_input("Axis1 X", value=float(preset["axis1"][0]), step=0.1, format="%.3f")
-            a1y = st.number_input("Axis1 Y", value=float(preset["axis1"][1]), step=0.1, format="%.3f")
-            a1z = st.number_input("Axis1 Z", value=float(preset["axis1"][2]), step=0.1, format="%.3f")
-
-            a2x = st.number_input("Axis2 X", value=float(preset["axis2"][0]), step=0.1, format="%.3f")
-            a2y = st.number_input("Axis2 Y", value=float(preset["axis2"][1]), step=0.1, format="%.3f")
-            a2z = st.number_input("Axis2 Z", value=float(preset["axis2"][2]), step=0.1, format="%.3f")
-
-            a3x = st.number_input("Axis3 X", value=float(preset["axis3"][0]), step=0.1, format="%.3f")
-            a3y = st.number_input("Axis3 Y", value=float(preset["axis3"][1]), step=0.1, format="%.3f")
-            a3z = st.number_input("Axis3 Z", value=float(preset["axis3"][2]), step=0.1, format="%.3f")
-
     if st.button("⚙️ Assembler (avec le preset)", type="primary"):
         try:
-            if use_override:
-                axis1 = (a1x, a1y, a1z)
-                axis2v = (a2x, a2y, a2z)
-                axis3 = (a3x, a3y, a3z)
-                origin = (tx, ty, tz)
-            else:
-                if not PRESET_PATH.exists():
-                    st.error("Aucun preset trouvé. Apprenez-le avec une référence assemblée.")
-                    return
-                axis1 = tuple(preset["axis1"])
-                axis2v = tuple(preset["axis2"])
-                axis3 = tuple(preset["axis3"])
-                origin = tuple(preset["origin"])
+            preset = load_step_preset()
+            if not preset:
+                raise ValueError("Aucun preset trouvé. Faites l’apprentissage une fois avec la référence assemblée.")
 
             out = build_step_assembly_option_b(
                 base_bytes=step_a_bytes,
                 part_bytes=step_b_bytes,
-                axis1=axis1,
-                axis2=axis2v,
-                axis3=axis3,
-                origin=origin,
+                axis1=tuple(preset["axis1"]),
+                axis2=tuple(preset["axis2"]),
+                axis3=tuple(preset["axis3"]),
+                origin=tuple(preset["origin"]),
             )
 
             st.success("STEP assemblé généré ✅")
