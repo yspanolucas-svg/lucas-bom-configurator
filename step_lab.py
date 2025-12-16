@@ -6,12 +6,13 @@ from typing import Dict, List, Tuple, Optional
 
 import streamlit as st
 
+
+# ============================================================
+# Preset
+# ============================================================
 PRESET_PATH = Path("presets/step_cantilever_default.json")
 
 
-# ============================================================
-# Preset JSON
-# ============================================================
 def load_step_preset() -> Optional[dict]:
     if PRESET_PATH.exists():
         with open(PRESET_PATH, "r", encoding="utf-8") as f:
@@ -169,14 +170,13 @@ def _cross(a, b):
 
 
 # ============================================================
-# Extraction : récupérer le nom du PRODUCT dans un STEP “simple”
+# Extraction : nom PRODUCT dans un STEP “simple”
 # ============================================================
 def extract_first_product_name(step_bytes: bytes) -> Optional[str]:
     _, ents, _ = parse_step(step_bytes)
     for eid in sorted(ents.keys()):
         body = ents[eid].strip()
         if body.upper().startswith("PRODUCT("):
-            # PRODUCT('NAME','DESC',...
             m = re.match(r"PRODUCT\(\s*'([^']+)'", body, flags=re.I)
             if m:
                 return m.group(1)
@@ -184,8 +184,8 @@ def extract_first_product_name(step_bytes: bytes) -> Optional[str]:
 
 
 # ============================================================
-# Extraction placement depuis référence assemblée
-# (ciblée sur base_name + part_name)
+# Apprentissage : extraction du placement depuis référence assemblée
+# Version robuste (ne dépend PAS du texte "Placement of ...")
 # ============================================================
 def extract_transform_from_reference_targeted(
     ref_bytes: bytes,
@@ -193,6 +193,24 @@ def extract_transform_from_reference_targeted(
     part_name: str
 ) -> Tuple[Tuple[float,float,float], Tuple[float,float,float], Tuple[float,float,float], Tuple[float,float,float]]:
     _, ents, _ = parse_step(ref_bytes)
+
+    def _best_name_match(target: str, candidates: List[str]) -> Optional[str]:
+        t = target.strip().lower()
+        if not t:
+            return None
+        # exact
+        for c in candidates:
+            if c.lower() == t:
+                return c
+        # prefix
+        for c in candidates:
+            if c.lower().startswith(t) or t.startswith(c.lower()):
+                return c
+        # contains
+        for c in candidates:
+            if t in c.lower() or c.lower() in t:
+                return c
+        return None
 
     # 1) Index CARTESIAN_POINT / DIRECTION / AXIS2_PLACEMENT_3D
     points = {}
@@ -237,56 +255,143 @@ def extract_transform_from_reference_targeted(
                 ref_id = None if ref_raw == "$" else int(ref_raw[1:])
                 axis2[eid] = (loc, axis_id, ref_id)
 
-    # 2) Trouver le PRODUCT_DEFINITION_SHAPE “Placement of <part> with respect to <base>”
-    pds_id = None
-    needle1 = f"PLACEMENT OF {part_name}".upper()
-    needle2 = f"WITH RESPECT TO {base_name}".upper()
-
-    for eid in sorted(ents.keys()):
-        body_up = ents[eid].upper()
-        if body_up.startswith("PRODUCT_DEFINITION_SHAPE") and (needle1 in body_up) and (needle2 in body_up):
-            pds_id = eid
-            break
-
-    if pds_id is None:
-        raise ValueError(
-            "Référence : impossible d’identifier le placement ciblé (PRODUCT_DEFINITION_SHAPE) "
-            f"pour part='{part_name}' / base='{base_name}'."
-        )
-
-    # 3) Trouver CONTEXT_DEPENDENT_SHAPE_REPRESENTATION(#rel,#pds)
-    rel_id = None
+    # 2) Index PRODUCT id -> name
+    product_id_by_name = {}
     for eid in sorted(ents.keys()):
         body = ents[eid].strip()
-        if body.upper().startswith("CONTEXT_DEPENDENT_SHAPE_REPRESENTATION"):
-            m = re.match(r"CONTEXT_DEPENDENT_SHAPE_REPRESENTATION\(\s*(#\d+)\s*,\s*(#\d+)\s*\)\s*;", body, flags=re.I)
-            if m and int(m.group(2)[1:]) == pds_id:
-                rel_id = int(m.group(1)[1:])
-                break
+        if body.upper().startswith("PRODUCT("):
+            m = re.match(r"PRODUCT\(\s*'([^']*)'", body, flags=re.I)
+            if m:
+                product_id_by_name[m.group(1)] = eid
 
-    if rel_id is None:
-        raise ValueError("Référence : CONTEXT_DEPENDENT_SHAPE_REPRESENTATION introuvable pour ce placement.")
+    if not product_id_by_name:
+        raise ValueError("Référence : aucun PRODUCT() trouvé, impossible d'apprendre le placement.")
 
-    # 4) Dans rel_id, trouver REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#idt)
-    rel_body = ents.get(rel_id, "")
-    m = re.search(r"REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION\(\s*(#\d+)\s*\)", rel_body, flags=re.I)
-    if not m:
-        raise ValueError("Référence : pas de REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION dans la relation trouvée.")
-    idt_id = int(m.group(1)[1:])
+    base_pick = _best_name_match(base_name, list(product_id_by_name.keys()))
+    part_pick = _best_name_match(part_name, list(product_id_by_name.keys()))
 
-    # 5) ITEM_DEFINED_TRANSFORMATION('', '', #ax2a, #ax2b)
-    idt_body = ents.get(idt_id, "")
-    m = re.match(r"ITEM_DEFINED_TRANSFORMATION\(\s*'[^']*'\s*,\s*'[^']*'\s*,\s*(#\d+)\s*,\s*(#\d+)\s*\)\s*;",
-                 idt_body, flags=re.I)
-    if not m:
-        raise ValueError("Référence : ITEM_DEFINED_TRANSFORMATION illisible pour le placement ciblé.")
-    ax2_b = int(m.group(2)[1:])
+    if not base_pick or not part_pick:
+        raise ValueError(
+            "Référence : impossible de retrouver les PRODUCT dans l'assemblage.\n"
+            f"Base demandé: {base_name}\nPart demandé: {part_name}\n"
+            "=> Les noms PRODUCT dans la référence sont probablement différents (tronqués/renommés)."
+        )
 
-    if ax2_b not in axis2:
-        raise ValueError("Référence : AXIS2_PLACEMENT_3D (cible) introuvable.")
+    base_prod_id = product_id_by_name[base_pick]
+    part_prod_id = product_id_by_name[part_pick]
 
-    loc_id, z_id, x_id = axis2[ax2_b]
-    origin = points.get(loc_id, (0.0, 0.0, 0.0))
+    # 3) PRODUCT_DEFINITION_FORMATION -> PRODUCT
+    pdf_to_product = {}
+    for eid, body in ents.items():
+        if body.upper().startswith("PRODUCT_DEFINITION_FORMATION"):
+            m = re.match(
+                r"PRODUCT_DEFINITION_FORMATION\(\s*'[^']*'\s*,\s*'[^']*'\s*,\s*(#\d+)\s*\)\s*;",
+                body, flags=re.I
+            )
+            if m:
+                pdf_to_product[eid] = int(m.group(1)[1:])
+
+    # 4) PRODUCT_DEFINITION -> PRODUCT_DEFINITION_FORMATION
+    pd_to_pdf = {}
+    for eid, body in ents.items():
+        if body.upper().startswith("PRODUCT_DEFINITION("):
+            m = re.match(
+                r"PRODUCT_DEFINITION\(\s*'[^']*'\s*,\s*'[^']*'\s*,\s*(#\d+)\s*,\s*(#\d+)\s*\)\s*;",
+                body, flags=re.I
+            )
+            if m:
+                pd_to_pdf[eid] = int(m.group(1)[1:])
+
+    def _find_pd_for_product(prod_id: int) -> Optional[int]:
+        for pd_id, pdf_id in pd_to_pdf.items():
+            p = pdf_to_product.get(pdf_id)
+            if p == prod_id:
+                return pd_id
+        return None
+
+    base_pd = _find_pd_for_product(base_prod_id)
+    part_pd = _find_pd_for_product(part_prod_id)
+
+    if base_pd is None or part_pd is None:
+        raise ValueError("Référence : PRODUCT_DEFINITION introuvable pour la base ou la pièce.")
+
+    # 5) PRODUCT_DEFINITION_SHAPE -> PRODUCT_DEFINITION (pour la pièce)
+    pds_list = []
+    for eid, body in ents.items():
+        if body.upper().startswith("PRODUCT_DEFINITION_SHAPE"):
+            m = re.match(
+                r"PRODUCT_DEFINITION_SHAPE\(\s*'[^']*'\s*,\s*'[^']*'\s*,\s*(#\d+)\s*\)\s*;",
+                body, flags=re.I
+            )
+            if m and int(m.group(1)[1:]) == part_pd:
+                pds_list.append(eid)
+
+    if not pds_list:
+        raise ValueError("Référence : aucun PRODUCT_DEFINITION_SHAPE lié à la pièce.")
+
+    # 6) CONTEXT_DEPENDENT_SHAPE_REPRESENTATION( #rel , #pds_part )
+    # puis #rel contient REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#idt)
+    re_cdsr = re.compile(
+        r"CONTEXT_DEPENDENT_SHAPE_REPRESENTATION\(\s*(#\d+)\s*,\s*(#\d+)\s*\)\s*;",
+        flags=re.I
+    )
+    re_rrwt = re.compile(
+        r"REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION\(\s*(#\d+)\s*\)",
+        flags=re.I
+    )
+    re_idt = re.compile(
+        r"ITEM_DEFINED_TRANSFORMATION\(\s*'[^']*'\s*,\s*'[^']*'\s*,\s*(#\d+)\s*,\s*(#\d+)\s*\)\s*;",
+        flags=re.I
+    )
+
+    candidates = []
+    for eid in sorted(ents.keys()):
+        body = ents[eid].strip()
+        if not body.upper().startswith("CONTEXT_DEPENDENT_SHAPE_REPRESENTATION"):
+            continue
+        m = re_cdsr.match(body)
+        if not m:
+            continue
+        rel_id = int(m.group(1)[1:])
+        pds_id = int(m.group(2)[1:])
+        if pds_id not in pds_list:
+            continue
+
+        rel_body = ents.get(rel_id, "")
+        m2 = re_rrwt.search(rel_body)
+        if not m2:
+            continue
+        idt_id = int(m2.group(1)[1:])
+
+        idt_body = ents.get(idt_id, "")
+        m3 = re_idt.match(idt_body.strip())
+        if not m3:
+            continue
+
+        ax2_b = int(m3.group(2)[1:])
+        if ax2_b not in axis2:
+            continue
+
+        loc_id, z_id, x_id = axis2[ax2_b]
+        origin = points.get(loc_id, (0.0, 0.0, 0.0))
+        d_origin = _norm(origin)
+
+        # On ne garde que les placements non-triviaux
+        if d_origin < 1e-6:
+            continue
+
+        candidates.append((d_origin, ax2_b, origin, z_id, x_id, eid, rel_id, idt_id))
+
+    if not candidates:
+        raise ValueError(
+            "Impossible d’extraire une transformation non-identité : "
+            "aucun placement CONTEXT_DEPENDENT_SHAPE_REPRESENTATION exploitable trouvé pour la pièce.\n"
+            "Astuce : si la référence a été exportée 'aplatie' (pas d'assemblage), il n'y aura pas de placements."
+        )
+
+    # 7) On choisit le placement avec la translation la plus significative
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, ax2_b, origin, z_id, x_id, _, _, _ = candidates[0]
 
     z = (0.0, 0.0, 1.0) if (z_id is None or z_id not in dirs) else dirs[z_id]
     x = (1.0, 0.0, 0.0) if (x_id is None or x_id not in dirs) else dirs[x_id]
@@ -311,7 +416,7 @@ def build_step_assembly_option_b(
     origin: Tuple[float,float,float],
 ) -> bytes:
     base_header, base_ents, _ = parse_step(base_bytes)
-    part_header, part_ents, _ = parse_step(part_bytes)
+    _, part_ents, _ = parse_step(part_bytes)
 
     base_max = max_entity_id(base_ents)
     offset = base_max + 1000
@@ -393,6 +498,201 @@ def build_step_assembly_option_b(
 
 
 # ============================================================
+# DEBUG HELPERS
+# ============================================================
+def _debug_list_products(step_bytes: bytes) -> list[tuple[int, str]]:
+    _, ents, _ = parse_step(step_bytes)
+    out = []
+    for eid in sorted(ents.keys()):
+        body = ents[eid].strip()
+        if body.upper().startswith("PRODUCT("):
+            m = re.match(r"PRODUCT\(\s*'([^']*)'", body, flags=re.I)
+            if m:
+                out.append((eid, m.group(1)))
+    return out
+
+
+def _debug_find_candidate_transforms(ref_bytes: bytes, part_name: str) -> list[dict]:
+    """
+    Debug : liste les placements trouvés pour la pièce dans la référence,
+    avec origins + ids STEP.
+    """
+    _, ents, _ = parse_step(ref_bytes)
+
+    # Index points / dirs / axis2
+    points, dirs, axis2 = {}, {}, {}
+
+    for eid, body in ents.items():
+        up = body.upper().strip()
+
+        if up.startswith("CARTESIAN_POINT"):
+            m = re.search(r"\(\s*'[^']*'\s*,\s*\(\s*([^\)]+)\s*\)\s*\)", body, flags=re.I)
+            if m:
+                parts = m.group(1).replace(" ", "").split(",")
+                if len(parts) == 3:
+                    try:
+                        points[eid] = tuple(float(p.replace("E", "e")) for p in parts)
+                    except:
+                        pass
+
+        elif up.startswith("DIRECTION"):
+            m = re.search(r"\(\s*'[^']*'\s*,\s*\(\s*([^\)]+)\s*\)\s*\)", body, flags=re.I)
+            if m:
+                parts = m.group(1).replace(" ", "").split(",")
+                if len(parts) == 3:
+                    try:
+                        d = tuple(float(p.replace("E", "e")) for p in parts)
+                        dirs[eid] = _normalize(d)
+                    except:
+                        pass
+
+        elif up.startswith("AXIS2_PLACEMENT_3D"):
+            m = re.match(
+                r"AXIS2_PLACEMENT_3D\(\s*'[^']*'\s*,\s*(#\d+)\s*,\s*([^,]+)\s*,\s*([^\)]+)\s*\)\s*;",
+                body.strip(),
+                flags=re.I
+            )
+            if m:
+                loc = int(m.group(1)[1:])
+                axis_raw = m.group(2).strip()
+                ref_raw = m.group(3).strip()
+                axis_id = None if axis_raw == "$" else int(axis_raw[1:])
+                ref_id = None if ref_raw == "$" else int(ref_raw[1:])
+                axis2[eid] = (loc, axis_id, ref_id)
+
+    # products in ref
+    products = _debug_list_products(ref_bytes)
+    names = [n for _, n in products]
+
+    # best-effort match
+    t = (part_name or "").strip().lower()
+    part_pick = None
+    for n in names:
+        if n.lower() == t:
+            part_pick = n
+            break
+    if not part_pick:
+        for n in names:
+            if n.lower().startswith(t) or t.startswith(n.lower()):
+                part_pick = n
+                break
+    if not part_pick:
+        for n in names:
+            if t in n.lower() or n.lower() in t:
+                part_pick = n
+                break
+
+    if not part_pick:
+        return [{"error": f"Part '{part_name}' non retrouvée dans les PRODUCT() de la référence."}]
+
+    # find product id
+    part_prod_id = None
+    for eid in sorted(ents.keys()):
+        b = ents[eid].strip()
+        if b.upper().startswith("PRODUCT("):
+            m = re.match(r"PRODUCT\(\s*'([^']*)'", b, flags=re.I)
+            if m and m.group(1) == part_pick:
+                part_prod_id = eid
+                break
+
+    if part_prod_id is None:
+        return [{"error": "Part PRODUCT id introuvable."}]
+
+    # PDF -> PRODUCT, PD -> PDF
+    pdf_to_product = {}
+    for eid, body in ents.items():
+        if body.upper().startswith("PRODUCT_DEFINITION_FORMATION"):
+            m = re.match(r"PRODUCT_DEFINITION_FORMATION\(\s*'[^']*'\s*,\s*'[^']*'\s*,\s*(#\d+)\s*\)\s*;", body, flags=re.I)
+            if m:
+                pdf_to_product[eid] = int(m.group(1)[1:])
+
+    pd_to_pdf = {}
+    for eid, body in ents.items():
+        if body.upper().startswith("PRODUCT_DEFINITION("):
+            m = re.match(r"PRODUCT_DEFINITION\(\s*'[^']*'\s*,\s*'[^']*'\s*,\s*(#\d+)\s*,\s*(#\d+)\s*\)\s*;", body, flags=re.I)
+            if m:
+                pd_to_pdf[eid] = int(m.group(1)[1:])
+
+    part_pd = None
+    for pd_id, pdf_id in pd_to_pdf.items():
+        if pdf_to_product.get(pdf_id) == part_prod_id:
+            part_pd = pd_id
+            break
+    if part_pd is None:
+        return [{"error": "PRODUCT_DEFINITION pour la pièce introuvable."}]
+
+    # PDS list
+    pds_list = []
+    for eid, body in ents.items():
+        if body.upper().startswith("PRODUCT_DEFINITION_SHAPE"):
+            m = re.match(r"PRODUCT_DEFINITION_SHAPE\(\s*'[^']*'\s*,\s*'[^']*'\s*,\s*(#\d+)\s*\)\s*;", body, flags=re.I)
+            if m and int(m.group(1)[1:]) == part_pd:
+                pds_list.append(eid)
+
+    if not pds_list:
+        return [{"error": "Aucun PRODUCT_DEFINITION_SHAPE pour la pièce."}]
+
+    # Cdsr candidates
+    re_cdsr = re.compile(
+        r"CONTEXT_DEPENDENT_SHAPE_REPRESENTATION\(\s*(#\d+)\s*,\s*(#\d+)\s*\)\s*;",
+        flags=re.I
+    )
+    re_rrwt = re.compile(
+        r"REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION\(\s*(#\d+)\s*\)",
+        flags=re.I
+    )
+    re_idt = re.compile(
+        r"ITEM_DEFINED_TRANSFORMATION\(\s*'[^']*'\s*,\s*'[^']*'\s*,\s*(#\d+)\s*,\s*(#\d+)\s*\)\s*;",
+        flags=re.I
+    )
+
+    candidates = []
+    for eid in sorted(ents.keys()):
+        body = ents[eid].strip()
+        if not body.upper().startswith("CONTEXT_DEPENDENT_SHAPE_REPRESENTATION"):
+            continue
+        m = re_cdsr.match(body)
+        if not m:
+            continue
+        rel_id = int(m.group(1)[1:])
+        pds_id = int(m.group(2)[1:])
+        if pds_id not in pds_list:
+            continue
+
+        rel_body = ents.get(rel_id, "")
+        m2 = re_rrwt.search(rel_body)
+        if not m2:
+            continue
+        idt_id = int(m2.group(1)[1:])
+        idt_body = ents.get(idt_id, "")
+        m3 = re_idt.match(idt_body.strip())
+        if not m3:
+            continue
+
+        ax2_b = int(m3.group(2)[1:])
+        if ax2_b not in axis2:
+            continue
+
+        loc_id, z_id, x_id = axis2[ax2_b]
+        origin = points.get(loc_id, (0.0, 0.0, 0.0))
+        d_origin = _norm(origin)
+
+        candidates.append({
+            "cdsr_entity_id": eid,
+            "relationship_entity_id": rel_id,
+            "idt_entity_id": idt_id,
+            "axis2_placement_3d_id": ax2_b,
+            "origin": origin,
+            "origin_norm": d_origin,
+            "z_dir_id": z_id,
+            "x_dir_id": x_id,
+        })
+
+    candidates.sort(key=lambda x: x["origin_norm"], reverse=True)
+    return candidates
+
+
+# ============================================================
 # STREAMLIT UI
 # ============================================================
 def render_step_lab_panel():
@@ -404,7 +704,7 @@ def render_step_lab_panel():
 
 **Apprentissage :**
 - On fournit Ensemble A + Ensemble B + un STEP assemblé de référence.
-- On extrait **la transformation ciblée** (placement du PRODUCT B dans l’assemblage).
+- On extrait le placement de **B** dans la référence via la structure d’assemblage STEP.
 - On sauvegarde `presets/step_cantilever_default.json`.
         """
     )
@@ -432,7 +732,76 @@ def render_step_lab_panel():
     step_b_bytes = step_b_up.read() if step_b_up else None
     ref_bytes = ref_up.read() if ref_up else None
 
+    # ---------------- DEBUG ----------------
+    st.markdown("---")
+    st.markdown("### 🐞 Debug (diagnostic)")
+    debug_on = st.checkbox("Activer le mode debug", value=False)
+
+    if debug_on:
+        colA, colB, colR = st.columns(3)
+
+        with colA:
+            st.write("**PRODUCT() – Ensemble A**")
+            if step_a_bytes:
+                prods = _debug_list_products(step_a_bytes)
+                st.write(f"{len(prods)} product(s)")
+                st.dataframe([{"#id": i, "name": n} for i, n in prods], use_container_width=True)
+            else:
+                st.info("Chargez Ensemble A")
+
+        with colB:
+            st.write("**PRODUCT() – Ensemble B**")
+            if step_b_bytes:
+                prods = _debug_list_products(step_b_bytes)
+                st.write(f"{len(prods)} product(s)")
+                st.dataframe([{"#id": i, "name": n} for i, n in prods], use_container_width=True)
+            else:
+                st.info("Chargez Ensemble B")
+
+        with colR:
+            st.write("**PRODUCT() – Référence assemblée**")
+            if ref_bytes:
+                prods = _debug_list_products(ref_bytes)
+                st.write(f"{len(prods)} product(s)")
+                st.dataframe([{"#id": i, "name": n} for i, n in prods[:30]], use_container_width=True)
+                if len(prods) > 30:
+                    st.caption("Affichage limité aux 30 premiers.")
+            else:
+                st.info("Chargez la référence assemblée")
+
+        if ref_bytes and step_b_bytes:
+            st.markdown("#### Candidats placement trouvés pour Ensemble B dans la référence")
+            part_name_guess = extract_first_product_name(step_b_bytes) or ""
+            st.caption(f"Nom PRODUCT détecté dans Ensemble B : {part_name_guess!r}")
+
+            cands = _debug_find_candidate_transforms(ref_bytes, part_name_guess)
+            if cands and "error" in cands[0]:
+                st.error(cands[0]["error"])
+            else:
+                st.write(f"{len(cands)} candidat(s) trouvé(s) (triés par translation |origin| décroissante).")
+                st.dataframe(
+                    [{
+                        "origin_norm": round(c["origin_norm"], 6),
+                        "origin": c["origin"],
+                        "cdsr": f"#{c['cdsr_entity_id']}",
+                        "rel": f"#{c['relationship_entity_id']}",
+                        "idt": f"#{c['idt_entity_id']}",
+                        "axis2": f"#{c['axis2_placement_3d_id']}",
+                    } for c in cands[:50]],
+                    use_container_width=True
+                )
+                if len(cands) > 50:
+                    st.caption("Affichage limité aux 50 premiers.")
+
+                st.info(
+                    "Astuce : si origin_norm est très faible partout, la référence est peut-être 'aplatie' "
+                    "(pas de vraie structure d'assemblage)."
+                )
+
+    # ---------------- Learning ----------------
+    st.markdown("---")
     st.markdown("### Apprendre / mettre à jour le preset")
+
     learn_disabled = (ref_bytes is None) or (step_a_bytes is None) or (step_b_bytes is None)
 
     if st.button("📚 Apprendre depuis la référence et enregistrer le preset", disabled=learn_disabled):
@@ -453,12 +822,13 @@ def render_step_lab_panel():
         except Exception as e:
             st.error(f"Erreur apprentissage : {e}")
 
+    # ---------------- Preset view ----------------
     st.markdown("---")
-
     preset = load_step_preset()
     with st.expander("Voir le preset actuel", expanded=False):
         st.json(preset if preset else {})
 
+    # ---------------- Assemble ----------------
     st.markdown("### Génération du STEP assemblé")
     if not step_a_bytes or not step_b_bytes:
         st.info("Chargez Ensemble A et Ensemble B pour activer l’assemblage.")
