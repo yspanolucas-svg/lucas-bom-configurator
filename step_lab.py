@@ -1,7 +1,6 @@
 import re
 import math
 import json
-import hashlib
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
@@ -13,7 +12,7 @@ import streamlit as st
 # STEP Lab (Option B)
 # - Assemblage STEP par réécriture texte (sans CAO)
 # - Apprentissage 1 fois via un STEP assemblé correct
-# - Sauvegarde d’un preset JSON (axes + origin) dans /presets
+# - Preset JSON (axes + origin) dans /presets
 # ============================================================
 
 PRESET_PATH = Path("presets/step_cantilever_default.json")
@@ -195,7 +194,29 @@ def replace_shape_definition_representation_target(
 
 
 # ----------------------------
-# Extraction transformation depuis un STEP assemblé référence
+# Maths / vecteurs
+# ----------------------------
+def _norm(v: Tuple[float, float, float]) -> float:
+    return math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
+
+
+def _normalize(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    n = _norm(v)
+    if n < 1e-12:
+        return (0.0, 0.0, 0.0)
+    return (v[0]/n, v[1]/n, v[2]/n)
+
+
+def _cross(a: Tuple[float,float,float], b: Tuple[float,float,float]) -> Tuple[float,float,float]:
+    return (
+        a[1]*b[2] - a[2]*b[1],
+        a[2]*b[0] - a[0]*b[2],
+        a[0]*b[1] - a[1]*b[0],
+    )
+
+
+# ----------------------------
+# Extraction infos géométriques
 # ----------------------------
 def _parse_cartesian_point(body: str) -> Optional[Tuple[float, float, float]]:
     m = re.search(r"CARTESIAN_POINT\s*\(\s*'[^']*'\s*,\s*\(\s*([^\)]+)\s*\)\s*\)", body, flags=re.I)
@@ -233,10 +254,32 @@ def _parse_direction(body: str) -> Optional[Tuple[float, float, float]]:
         return None
 
 
-def _norm(v: Tuple[float, float, float]) -> float:
-    return math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
+def _parse_axis2_placement_3d(body: str) -> Optional[Tuple[int, Optional[int], Optional[int]]]:
+    """
+    AXIS2_PLACEMENT_3D('',#loc,#axis,#ref)
+    axis/ref peuvent être $ selon export.
+    Retour: (loc_point_id, axis_dir_id|None, ref_dir_id|None)
+    """
+    m = re.match(
+        r"^\s*AXIS2_PLACEMENT_3D\s*\(\s*'[^']*'\s*,\s*(#\d+)\s*,\s*([^,]+)\s*,\s*([^\)]+)\s*\)\s*;\s*$",
+        body.strip(),
+        flags=re.I
+    )
+    if not m:
+        return None
+    loc = int(m.group(1)[1:])
+    axis_raw = m.group(2).strip()
+    ref_raw = m.group(3).strip()
+
+    axis = None if axis_raw == "$" else int(axis_raw[1:])
+    ref = None if ref_raw == "$" else int(ref_raw[1:])
+    return (loc, axis, ref)
 
 
+# ----------------------------
+# Extraction transformation depuis un STEP assemblé référence
+# (robuste : CTO3D / ITEM_DEFINED_TRANSFORMATION / fallback AXIS2)
+# ----------------------------
 def extract_transform_from_reference(ref_bytes: bytes) -> Tuple[
     Tuple[float,float,float],
     Tuple[float,float,float],
@@ -244,16 +287,18 @@ def extract_transform_from_reference(ref_bytes: bytes) -> Tuple[
     Tuple[float,float,float]
 ]:
     """
-    Cherche la meilleure CARTESIAN_TRANSFORMATION_OPERATOR_3D non-identité.
-    Heuristique cantilever :
-    - on ignore origine ~ (0,0,0)
-    - on prend la transformation avec la plus grande distance d'origine
+    Retourne axis1(X), axis2(Y), axis3(Z), origin(Tx,Ty,Tz)
+    en essayant successivement:
+      A) CARTESIAN_TRANSFORMATION_OPERATOR_3D non-identité
+      B) ITEM_DEFINED_TRANSFORMATION + AXIS2_PLACEMENT_3D (très courant en AP242)
+      C) fallback : meilleur AXIS2_PLACEMENT_3D non-zero
     """
     ref = parse_step(ref_bytes)
     ents = ref.entities
 
     points: Dict[int, Tuple[float,float,float]] = {}
     dirs: Dict[int, Tuple[float,float,float]] = {}
+    axis2: Dict[int, Tuple[int, Optional[int], Optional[int]]] = {}
 
     for eid, body in ents.items():
         up = body.upper().strip()
@@ -264,8 +309,15 @@ def extract_transform_from_reference(ref_bytes: bytes) -> Tuple[
         elif up.startswith("DIRECTION"):
             d = _parse_direction(body)
             if d:
-                dirs[eid] = d
+                dirs[eid] = _normalize(d)
+        elif up.startswith("AXIS2_PLACEMENT_3D"):
+            a = _parse_axis2_placement_3d(body)
+            if a:
+                axis2[eid] = a
 
+    # ------------------------------------------------------------
+    # A) CARTESIAN_TRANSFORMATION_OPERATOR_3D
+    # ------------------------------------------------------------
     re_cto = re.compile(
         r"^CARTESIAN_TRANSFORMATION_OPERATOR_3D\s*\(\s*'[^']*'\s*,\s*(#\d+)\s*,\s*(#\d+)\s*,\s*(#\d+)\s*,\s*([^,]+)\s*,\s*(#\d+)\s*\)\s*;\s*$",
         flags=re.I
@@ -290,26 +342,100 @@ def extract_transform_from_reference(ref_bytes: bytes) -> Tuple[
 
         origin = points[loc]
         d_origin = _norm(origin)
-
         if d_origin < 1e-6:
             continue
 
-        # axes proches de unitaires (tolérance)
-        if abs(_norm(dirs[a1]) - 1.0) > 1e-2:
-            continue
-        if abs(_norm(dirs[a2]) - 1.0) > 1e-2:
-            continue
-        if abs(_norm(dirs[a3]) - 1.0) > 1e-2:
-            continue
+        axis1 = dirs[a1]
+        axis2v = dirs[a2]
+        axis3 = dirs[a3]
 
         if d_origin > best_score:
             best_score = d_origin
-            best = (dirs[a1], dirs[a2], dirs[a3], origin)
+            best = (axis1, axis2v, axis3, origin)
 
-    if best is None:
-        raise ValueError("Impossible d’extraire une transformation non-identité dans la référence.")
+    if best is not None:
+        return best
 
-    return best  # axis1, axis2, axis3, origin
+    # ------------------------------------------------------------
+    # B) ITEM_DEFINED_TRANSFORMATION
+    # ITEM_DEFINED_TRANSFORMATION('', '', #ax2a, #ax2b);
+    # On prend la cible (ax2b) comme repère position/rotation.
+    # ------------------------------------------------------------
+    re_idt = re.compile(
+        r"^\s*ITEM_DEFINED_TRANSFORMATION\s*\(\s*'[^']*'\s*,\s*'[^']*'\s*,\s*(#\d+)\s*,\s*(#\d+)\s*\)\s*;\s*$",
+        flags=re.I
+    )
+
+    best = None
+    best_score = -1.0
+
+    for eid in sorted(ents.keys()):
+        body = ents[eid].strip()
+        m = re_idt.match(body)
+        if not m:
+            continue
+        ax2_a = int(m.group(1)[1:])
+        ax2_b = int(m.group(2)[1:])
+
+        if ax2_b not in axis2:
+            continue
+
+        loc_id, z_id, x_id = axis2[ax2_b]
+        if loc_id not in points:
+            continue
+
+        origin = points[loc_id]
+        d_origin = _norm(origin)
+        if d_origin < 1e-6:
+            continue
+
+        # z axis
+        z = (0.0, 0.0, 1.0) if (z_id is None or z_id not in dirs) else dirs[z_id]
+        # x axis
+        x = (1.0, 0.0, 0.0) if (x_id is None or x_id not in dirs) else dirs[x_id]
+
+        x = _normalize(x)
+        z = _normalize(z)
+        y = _normalize(_cross(z, x))  # Y = Z x X (convention repère direct)
+        # Re-orthonormaliser X = Y x Z (au cas où)
+        x = _normalize(_cross(y, z))
+
+        if d_origin > best_score:
+            best_score = d_origin
+            best = (x, y, z, origin)
+
+    if best is not None:
+        return best
+
+    # ------------------------------------------------------------
+    # C) Fallback : meilleur AXIS2_PLACEMENT_3D non-zero
+    # ------------------------------------------------------------
+    best = None
+    best_score = -1.0
+    for ax2_id, (loc_id, z_id, x_id) in axis2.items():
+        if loc_id not in points:
+            continue
+        origin = points[loc_id]
+        d_origin = _norm(origin)
+        if d_origin < 1e-6:
+            continue
+
+        z = (0.0, 0.0, 1.0) if (z_id is None or z_id not in dirs) else dirs[z_id]
+        x = (1.0, 0.0, 0.0) if (x_id is None or x_id not in dirs) else dirs[x_id]
+
+        x = _normalize(x)
+        z = _normalize(z)
+        y = _normalize(_cross(z, x))
+        x = _normalize(_cross(y, z))
+
+        if d_origin > best_score:
+            best_score = d_origin
+            best = (x, y, z, origin)
+
+    if best is not None:
+        return best
+
+    raise ValueError("Impossible d’extraire une transformation exploitable dans la référence (CTO3D / IDT / AXIS2).")
 
 
 # ----------------------------
@@ -331,29 +457,26 @@ def build_step_assembly_option_b(
     base = parse_step(base_bytes)
     part = parse_step(part_bytes)
 
-    # 1) Renumérotation PART pour éviter collisions
+    # Renumérotation PART
     base_max = max_entity_id(base.entities)
     offset = base_max + 1000
     part_renum = renumber_entities(part.entities, offset)
 
-    # 2) Fusion entités (Base + Part)
     merged = dict(base.entities)
     merged.update(part_renum)
 
-    # 3) Contexte (on reprend celui du fichier base)
     ctx_id = find_first_id_containing(merged, ["GEOMETRIC_REPRESENTATION_CONTEXT"])
     if ctx_id is None:
         raise ValueError("GEOMETRIC_REPRESENTATION_CONTEXT introuvable dans le STEP base.")
 
-    # 4) Trouver les SHAPE_REPRESENTATION des deux ensembles
     base_shape_id = find_first_shape_representation_id(base.entities)
     if base_shape_id is None:
         raise ValueError("SHAPE_REPRESENTATION introuvable dans le STEP base.")
+
     part_shape_id = find_first_shape_representation_id(part_renum)
     if part_shape_id is None:
         raise ValueError("SHAPE_REPRESENTATION introuvable dans le STEP ajouté.")
 
-    # 5) Ajout des entités nécessaires pour construire une SHAPE_REPRESENTATION globale
     nid = max_entity_id(merged) + 1
 
     def add(entity: str) -> int:
@@ -365,7 +488,7 @@ def build_step_assembly_option_b(
         nid += 1
         return nid - 1
 
-    # ---- Mapping base (identité)
+    # Base mapping (identité)
     b_loc = add("CARTESIAN_POINT('',(0.,0.,0.))")
     b_axis = add("DIRECTION('',(0.,0.,1.))")
     b_ref  = add("DIRECTION('',(1.,0.,0.))")
@@ -379,7 +502,7 @@ def build_step_assembly_option_b(
     b_xf  = add(f"CARTESIAN_TRANSFORMATION_OPERATOR_3D('',#{b_a1},#{b_a2},#{b_org},1.,#{b_a3})")
     b_mapped = add(f"MAPPED_ITEM(#{b_map},#{b_xf})")
 
-    # ---- Mapping part (transformation preset)
+    # Part mapping (preset)
     p_loc = add("CARTESIAN_POINT('',(0.,0.,0.))")
     p_axis = add("DIRECTION('',(0.,0.,1.))")
     p_ref  = add("DIRECTION('',(1.,0.,0.))")
@@ -393,18 +516,15 @@ def build_step_assembly_option_b(
     p_xf  = add(f"CARTESIAN_TRANSFORMATION_OPERATOR_3D('',#{p_a1},#{p_a2},#{p_org},1.,#{p_a3})")
     p_mapped = add(f"MAPPED_ITEM(#{p_map},#{p_xf})")
 
-    # ---- Nouvelle représentation globale
+    # Nouvelle shape rep globale
     new_shape_rep = add(f"SHAPE_REPRESENTATION('',(#{b_mapped},#{p_mapped}),#{ctx_id})")
 
-    # ---- Pointer la définition de forme principale vers la nouvelle shape rep
     modified = replace_shape_definition_representation_target(merged, new_shape_rep)
     if not modified:
-        # fallback : ajouter une SHAPE_DEFINITION_REPRESENTATION si possible
         pd_id = find_first_id_containing(merged, ["PRODUCT_DEFINITION"])
         if pd_id is not None:
             add(f"SHAPE_DEFINITION_REPRESENTATION(#{pd_id},#{new_shape_rep})")
 
-    # 6) Recomposer un fichier STEP propre (un seul modèle)
     out = []
     out.extend(base.header_lines)
 
@@ -428,18 +548,17 @@ def render_step_lab_panel():
 
     st.markdown(
         """
-**But :** assembler deux STEP (Ensemble A + Ensemble B) en appliquant une règle de placement **déterministe**,
-comme pour le PDF Lab, sans ouvrir de logiciel CAO.
+**But :** assembler deux STEP (Ensemble A + Ensemble B) en appliquant une règle de placement déterministe.
 
-**Mode recommandé :**
-1) **Apprendre une fois** la règle avec un STEP assemblé correct (référence).  
-2) Réutiliser ensuite cette règle automatiquement via un **preset** (fichier JSON léger).
-
-Le preset est enregistré ici : `presets/step_cantilever_default.json`
+**Principe :**
+- 1) Vous chargez une référence assemblée correcte **une seule fois** → on apprend la transformation.
+- 2) On sauvegarde la règle dans `presets/step_cantilever_default.json`.
+- 3) Ensuite : vous assemblez ES + RC2 sans recharger la référence.
         """
     )
 
     preset = load_step_preset()
+
     colp1, colp2 = st.columns([2, 1])
     with colp1:
         if preset:
@@ -467,19 +586,13 @@ Le preset est enregistré ici : `presets/step_cantilever_default.json`
 
     with c2:
         st.markdown("### 2) Apprentissage (1 fois)")
-        ref_up = st.file_uploader(
-            "STEP référence assemblé (cantilever correct)",
-            type=["stp", "step"],
-            key="step_ref"
-        )
-        st.caption("Astuce : ce fichier ne sera pas stocké. On ne garde que la règle (axes + origin).")
+        ref_up = st.file_uploader("STEP référence assemblé (cantilever correct)", type=["stp", "step"], key="step_ref")
+        st.caption("Ce fichier n’est pas stocké. On ne garde que la règle (axes + origin).")
 
-    # Lire bytes 1 seule fois
     step_a_bytes = step_a_up.read() if step_a_up else None
     step_b_bytes = step_b_up.read() if step_b_up else None
     ref_bytes = ref_up.read() if ref_up else None
 
-    # --- Apprentissage preset
     st.markdown("### Apprendre / mettre à jour le preset")
     if st.button("📚 Apprendre depuis la référence et enregistrer le preset", disabled=(ref_bytes is None)):
         try:
@@ -498,18 +611,15 @@ Le preset est enregistré ici : `presets/step_cantilever_default.json`
 
     st.markdown("---")
 
-    # --- Affichage preset actuel
     preset = load_step_preset() or default_preset_dict()
     with st.expander("Voir le preset actuel", expanded=False):
         st.json(preset)
 
-    # --- Assemblage
     st.markdown("### Génération du STEP assemblé")
     if not step_a_bytes or not step_b_bytes:
         st.info("Chargez Ensemble A et Ensemble B pour activer l’assemblage.")
         return
 
-    # Option debug : override manuel (facultatif)
     with st.expander("Réglages avancés (optionnel)", expanded=False):
         use_override = st.checkbox("Forcer une transformation manuelle (debug)", value=False)
         if use_override:
@@ -533,7 +643,7 @@ Le preset est enregistré ici : `presets/step_cantilever_default.json`
         try:
             if use_override:
                 axis1 = (a1x, a1y, a1z)
-                axis2 = (a2x, a2y, a2z)
+                axis2v = (a2x, a2y, a2z)
                 axis3 = (a3x, a3y, a3z)
                 origin = (tx, ty, tz)
             else:
@@ -541,7 +651,7 @@ Le preset est enregistré ici : `presets/step_cantilever_default.json`
                     st.error("Aucun preset trouvé. Apprenez-le avec une référence assemblée.")
                     return
                 axis1 = tuple(preset["axis1"])
-                axis2 = tuple(preset["axis2"])
+                axis2v = tuple(preset["axis2"])
                 axis3 = tuple(preset["axis3"])
                 origin = tuple(preset["origin"])
 
@@ -549,7 +659,7 @@ Le preset est enregistré ici : `presets/step_cantilever_default.json`
                 base_bytes=step_a_bytes,
                 part_bytes=step_b_bytes,
                 axis1=axis1,
-                axis2=axis2,
+                axis2=axis2v,
                 axis3=axis3,
                 origin=origin,
             )
@@ -561,6 +671,5 @@ Le preset est enregistré ici : `presets/step_cantilever_default.json`
                 file_name="ASSEMBLY_STEP_LAB.stp",
                 mime="application/step",
             )
-
         except Exception as e:
             st.error(f"Erreur pendant l’assemblage : {e}")
